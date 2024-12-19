@@ -679,7 +679,10 @@ fn new_remote_event_sink_if_fbcode(
     #[cfg(not(fbcode_build))]
     {
         let _ = (fb, config);
-        Ok(Some(RemoteEventSink::new()?))
+        match std::env::var("BES_URI") {
+          Ok(_) => Ok(Some(RemoteEventSink::new()?)),
+          _ => Ok(None),
+        }
     }
 }
 
