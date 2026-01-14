@@ -924,6 +924,7 @@ impl REClient {
         metadata: RemoteExecutionMetadata,
         request: DownloadRequest,
     ) -> anyhow::Result<DownloadResponse> {
+        // log::error!("{:?}", request);
         download_impl(
             &self.instance_name,
             request,
@@ -1258,210 +1259,250 @@ async fn download_impl<Byt, BytRet, Cas>(
     request: DownloadRequest,
     bystream_compressor: Option<Compressor>,
     max_total_batch_size: usize,
-    cas_f: impl Fn(BatchReadBlobsRequest) -> Cas,
+    cas_f: impl Fn(BatchReadBlobsRequest) -> Cas + Copy,
     bystream_fut: impl Fn(ReadRequest) -> Byt + Sync + Send + Copy,
 ) -> anyhow::Result<DownloadResponse>
 where
-    Byt: Future<Output = anyhow::Result<Pin<Box<BytRet>>>>,
+    Byt: Future<Output = anyhow::Result<Pin<Box<BytRet>>>> + Send,
     BytRet: Stream<Item = Result<ReadResponse, tonic::Status>> + Send,
-    Cas: Future<Output = anyhow::Result<BatchReadBlobsResponse>>,
+    Cas: Future<Output = anyhow::Result<BatchReadBlobsResponse>> + Send,
 {
-    fn resource_name(
-        instance_name: &InstanceName,
-        compressor: Option<Compressor>,
-        digest: &TDigest,
-    ) -> String {
-        if let Some(compressor) = compressor {
-            format!(
-                "{}compressed-blobs/{}/{}/{}",
-                instance_name.as_resource_prefix(),
-                compressor.name(),
-                digest.hash,
-                digest.size_in_bytes,
-            )
-        } else {
-            format!(
-                "{}blobs/{}/{}",
-                instance_name.as_resource_prefix(),
-                digest.hash,
-                digest.size_in_bytes,
-            )
-        }
-    }
-
-    let bystream_fut = |digest: TDigest| async move {
-        let resource_name = resource_name(&instance_name, bystream_compressor, &digest);
-
-        bystream_fut(ReadRequest {
-            resource_name: resource_name.clone(),
-            read_offset: 0,
-            read_limit: 0,
-        })
-        .await
-        // adapt the tokio Stream of ReadResponse into a StreamReader
-        .map(|p| {
-            let blob_reader = StreamReader::new(
-                p.map(|r| r.map(|rr| Cursor::new(rr.data)).map_err(io::Error::other)),
-            );
-            // Wrap the blob reader in a compression reader
-            let reader: Pin<Box<dyn AsyncRead + Unpin + Send>> = match bystream_compressor {
-                None => Pin::new(Box::new(blob_reader)),
-                Some(Compressor::Zstd) => {
-                    let mut decoder = ZstdDecoder::new(blob_reader);
-                    decoder.multiple_members(true);
-                    Pin::new(Box::new(decoder))
-                }
-                Some(Compressor::Deflate) => {
-                    let mut decoder = DeflateDecoder::new(blob_reader);
-                    decoder.multiple_members(true);
-                    Pin::new(Box::new(decoder))
-                }
-                Some(Compressor::Brotli) => {
-                    let mut decoder = BrotliDecoder::new(blob_reader);
-                    decoder.multiple_members(true);
-                    Pin::new(Box::new(decoder))
-                }
-            };
-
-            reader
-        })
-        .with_context(|| format!("Failed to read {resource_name} from Bytestream service"))
-    };
-
     let inlined_digests = request.inlined_digests.unwrap_or_default();
     let file_digests = request.file_digests.unwrap_or_default();
 
-    let mut curr_size = 0;
-    let mut requests = vec![];
-    let mut curr_digests = vec![];
-    for digest in file_digests
-        .iter()
-        .map(|req| &req.named_digest.digest)
-        .chain(inlined_digests.iter())
-        .map(|d| tdigest_to(d.clone()))
-        .filter(|d| d.size_bytes > 0)
-    {
-        if digest.size_bytes as usize >= max_total_batch_size {
-            // digest is too big to download in a BatchReadBlobsRequest
-            // need to use the bytstream api
-            continue;
-        }
-        curr_size += digest.size_bytes;
-        if curr_size >= max_total_batch_size as i64 {
-            let read_blob_req = BatchReadBlobsRequest {
-                instance_name: instance_name.as_str().to_owned(),
-                digests: std::mem::take(&mut curr_digests),
-                acceptable_compressors: vec![compressor::Value::Identity as i32],
-                ..Default::default()
+    // Helper: create bytestream reader with decompression
+    let make_reader = |digest: &TDigest| {
+        let prefix = instance_name.as_resource_prefix();
+        let name = match bystream_compressor {
+            Some(c) => format!(
+                "{}compressed-blobs/{}/{}/{}",
+                prefix,
+                c.name(),
+                digest.hash,
+                digest.size_in_bytes
+            ),
+            None => format!("{}blobs/{}/{}", prefix, digest.hash, digest.size_in_bytes),
+        };
+        async move {
+            let stream = bystream_fut(ReadRequest {
+                resource_name: name.clone(),
+                read_offset: 0,
+                read_limit: 0,
+            })
+            .await
+            .with_context(|| format!("Failed to read {name}"))?;
+            let blob_reader = StreamReader::new(
+                stream.map(|r| r.map(|rr| Cursor::new(rr.data)).map_err(io::Error::other)),
+            );
+            let reader: Pin<Box<dyn AsyncRead + Unpin + Send>> = match bystream_compressor {
+                None => Pin::new(Box::new(blob_reader)),
+                Some(Compressor::Zstd) => {
+                    let mut d = ZstdDecoder::new(blob_reader);
+                    d.multiple_members(true);
+                    Pin::new(Box::new(d))
+                }
+                Some(Compressor::Deflate) => {
+                    let mut d = DeflateDecoder::new(blob_reader);
+                    d.multiple_members(true);
+                    Pin::new(Box::new(d))
+                }
+                Some(Compressor::Brotli) => {
+                    let mut d = BrotliDecoder::new(blob_reader);
+                    d.multiple_members(true);
+                    Pin::new(Box::new(d))
+                }
             };
-            requests.push(read_blob_req);
-            curr_size = digest.size_bytes;
+            anyhow::Ok(reader)
         }
-        curr_digests.push(digest.clone());
-    }
+    };
 
-    if !curr_digests.is_empty() {
-        let read_blob_req = BatchReadBlobsRequest {
+    let is_large = |size: i64| size as usize >= max_total_batch_size;
+
+    // Group small FILES into batches (each batch fetches + writes its files)
+    let small_files: Vec<_> = file_digests
+        .iter()
+        .filter(|r| {
+            r.named_digest.digest.size_in_bytes > 0
+                && !is_large(r.named_digest.digest.size_in_bytes)
+        })
+        .collect();
+    let file_batches = group_into_batches(&small_files, max_total_batch_size, |r| {
+        r.named_digest.digest.size_in_bytes
+    });
+
+    // Group small INLINED digests into batches (each batch fetches + returns data)
+    let small_inlined: Vec<_> = inlined_digests
+        .iter()
+        .filter(|d| d.size_in_bytes > 0 && !is_large(d.size_in_bytes))
+        .collect();
+    let inlined_batches =
+        group_into_batches(&small_inlined, max_total_batch_size, |d| d.size_in_bytes);
+
+    // Each file batch: fetch digests, then write all files immediately
+    let file_batch_futs = file_batches.into_iter().map(|batch| {
+        let req = BatchReadBlobsRequest {
             instance_name: instance_name.as_str().to_owned(),
-            digests: std::mem::take(&mut curr_digests),
+            digests: batch
+                .iter()
+                .map(|r| tdigest_to(r.named_digest.digest.clone()))
+                .collect(),
             acceptable_compressors: vec![compressor::Value::Identity as i32],
             ..Default::default()
         };
-        requests.push(read_blob_req);
-    }
-
-    let mut batched_blobs_response = HashMap::new();
-    for read_blob_req in requests {
-        let resp = cas_f(read_blob_req)
-            .await
-            .context("Failed to make BatchReadBlobs request")?;
-        for r in resp.responses.into_iter() {
-            let digest = tdigest_from(r.digest.context("Response digest not found.")?);
-            check_status(r.status.unwrap_or_default())?;
-            batched_blobs_response.insert(digest, r.data);
-        }
-    }
-
-    let get = |digest: &TDigest| -> anyhow::Result<Vec<u8>> {
-        if digest.size_in_bytes == 0 {
-            return Ok(Vec::new());
-        }
-
-        Ok(batched_blobs_response
-            .get(digest)
-            .with_context(|| format!("Did not receive digest data for `{digest}`"))?
-            .clone())
-    };
-
-    let mut inlined_blobs = vec![];
-    for digest in inlined_digests {
-        let data = if digest.size_in_bytes as usize >= max_total_batch_size {
-            let mut accum = vec![];
-            let mut reader = bystream_fut(digest.clone()).await?;
-            tokio::io::copy(&mut reader, &mut accum).await?;
-            accum
-        } else {
-            get(&digest)?
-        };
-        inlined_blobs.push(InlinedDigestWithStatus {
-            digest,
-            status: tstatus_ok(),
-            blob: data,
-        })
-    }
-
-    let writes = file_digests.iter().map(|req| async {
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            if req.is_executable {
-                opts.mode(0o755);
-            } else {
-                opts.mode(0o644);
+        async move {
+            let resp = cas_f(req).await.context("Batch request failed")?;
+            let data: HashMap<_, _> = resp
+                .responses
+                .into_iter()
+                .map(|r| -> anyhow::Result<_> {
+                    check_status(r.status.unwrap_or_default())?;
+                    Ok((tdigest_from(r.digest.context("Missing digest")?), r.data))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            for file_req in batch {
+                let mut file = open_file(file_req).await?;
+                if let Some(bytes) = data.get(&file_req.named_digest.digest) {
+                    file.write_all(bytes).await?;
+                }
+                file.flush().await?;
             }
-        }
-
-        let fut = async {
-            let mut file = opts
-                .open(&req.named_digest.name)
-                .await
-                .context("Error opening")?;
-
-            // If the data is small enough to be transferred in a batch
-            // blob update, write it all at once to the file. Otherwise, it'll
-            // be streamed in chunks as the remote responds.
-            if req.named_digest.digest.size_in_bytes < max_total_batch_size as i64 {
-                let data = get(&req.named_digest.digest)?;
-                file.write_all(&data)
-                    .await
-                    .with_context(|| format!("Error writing: {}", req.named_digest.digest))?;
-            } else {
-                let mut reader = bystream_fut(req.named_digest.digest.clone()).await?;
-                tokio::io::copy(&mut reader, &mut file)
-                    .await
-                    .with_context(|| {
-                        format!("Error writing chunk of: {}", req.named_digest.digest)
-                    })?;
-            }
-            file.flush().await.context("Error flushing")?;
             anyhow::Ok(())
-        };
-        fut.await.with_context(|| {
-            format!(
-                "Error downloading digest `{}` to `{}`",
-                req.named_digest.digest, req.named_digest.name,
-            )
-        })
+        }
     });
 
-    buck2_util::future::try_join_all(writes).await?;
+    // Each inlined batch: fetch digests, return the data
+    let inlined_batch_futs = inlined_batches.into_iter().map(|batch| {
+        let req = BatchReadBlobsRequest {
+            instance_name: instance_name.as_str().to_owned(),
+            digests: batch.iter().map(|d| tdigest_to((*d).clone())).collect(),
+            acceptable_compressors: vec![compressor::Value::Identity as i32],
+            ..Default::default()
+        };
+        async move {
+            let resp = cas_f(req).await.context("Batch request failed")?;
+            resp.responses
+                .into_iter()
+                .map(|r| -> anyhow::Result<_> {
+                    check_status(r.status.unwrap_or_default())?;
+                    Ok((tdigest_from(r.digest.context("Missing digest")?), r.data))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+        }
+    });
+
+    // Large files: stream directly to disk
+    let large_file_futs = file_digests
+        .iter()
+        .filter(|r| is_large(r.named_digest.digest.size_in_bytes))
+        .map(|req| async {
+            let mut file = open_file(req).await?;
+            let mut reader = make_reader(&req.named_digest.digest).await?;
+            tokio::io::copy(&mut reader, &mut file).await?;
+            file.flush().await?;
+            anyhow::Ok(())
+        });
+
+    // Large inlined: stream to memory
+    let large_inlined_futs = inlined_digests
+        .iter()
+        .filter(|d| is_large(d.size_in_bytes))
+        .map(|digest| async {
+            let mut reader = make_reader(digest).await?;
+            let mut data = Vec::new();
+            tokio::io::copy(&mut reader, &mut data).await?;
+            anyhow::Ok((digest.clone(), data))
+        });
+
+    // Empty files: just create them
+    let empty_file_futs = file_digests
+        .iter()
+        .filter(|r| r.named_digest.digest.size_in_bytes == 0)
+        .map(|req| async {
+            open_file(req).await?;
+            anyhow::Ok(())
+        });
+
+    // Run ALL futures simultaneously
+    let (_, inlined_batch_results, large_inlined_results, _, _) = futures::future::try_join5(
+        futures::future::try_join_all(file_batch_futs),
+        futures::future::try_join_all(inlined_batch_futs),
+        futures::future::try_join_all(large_inlined_futs),
+        futures::future::try_join_all(large_file_futs),
+        futures::future::try_join_all(empty_file_futs),
+    )
+    .await?;
+
+    // Build inlined response from batch + large results
+    let mut blob_data: HashMap<TDigest, Vec<u8>> = HashMap::new();
+    for batch in inlined_batch_results {
+        for (digest, data) in batch {
+            blob_data.insert(digest, data);
+        }
+    }
+    for (digest, data) in large_inlined_results {
+        blob_data.insert(digest, data);
+    }
+
+    let inlined_blobs = inlined_digests
+        .into_iter()
+        .map(|digest| {
+            let data = if digest.size_in_bytes == 0 {
+                Vec::new()
+            } else {
+                blob_data
+                    .get(&digest)
+                    .cloned()
+                    .with_context(|| format!("Missing data for {digest}"))?
+            };
+            anyhow::Ok(InlinedDigestWithStatus {
+                digest,
+                status: tstatus_ok(),
+                blob: data,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     Ok(DownloadResponse {
         inlined_blobs: Some(inlined_blobs),
         directories: None,
         local_cache_stats: Default::default(),
     })
+}
+
+fn group_into_batches<T: Clone, F: Fn(&T) -> i64>(
+    items: &[T],
+    max_size: usize,
+    get_size: F,
+) -> Vec<Vec<T>> {
+    let mut batches = Vec::new();
+    let mut curr_batch = Vec::new();
+    let mut curr_size: i64 = 0;
+    for item in items {
+        let size = get_size(item);
+        if curr_size + size >= max_size as i64 && !curr_batch.is_empty() {
+            batches.push(std::mem::take(&mut curr_batch));
+            curr_size = 0;
+        }
+        curr_size += size;
+        curr_batch.push(item.clone());
+    }
+    if !curr_batch.is_empty() {
+        batches.push(curr_batch);
+    }
+    batches
+}
+
+async fn open_file(req: &NamedDigestWithPermissions) -> anyhow::Result<tokio::fs::File> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(if req.is_executable { 0o755 } else { 0o644 });
+    }
+    opts.open(&req.named_digest.name)
+        .await
+        .context("Error opening file")
 }
 
 async fn upload_impl<Byt, Cas>(

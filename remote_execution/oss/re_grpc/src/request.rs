@@ -18,21 +18,21 @@ pub struct ActionResultRequest {
     pub _dot_dot: (),
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct DownloadRequest {
     pub inlined_digests: Option<Vec<TDigest>>,
     pub file_digests: Option<Vec<NamedDigestWithPermissions>>,
     pub _dot_dot: (),
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct NamedDigestWithPermissions {
     pub named_digest: NamedDigest,
     pub is_executable: bool,
     pub _dot_dot: (),
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct NamedDigest {
     pub name: String,
     pub digest: TDigest,
