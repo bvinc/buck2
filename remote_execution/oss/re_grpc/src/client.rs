@@ -1516,9 +1516,15 @@ fn group_into_batches<T: Clone, F: Fn(&T) -> i64>(
 
 async fn open_file(req: &NamedDigestWithPermissions) -> anyhow::Result<tokio::fs::File> {
     let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
+    opts.read(true).write(true).create_new(true);
     #[cfg(unix)]
-    opts.mode(if req.is_executable { 0o755 } else { 0o644 });
+    {
+        if req.is_executable {
+            opts.mode(0o755);
+        } else {
+            opts.mode(0o644);
+        }
+    }
     opts.open(&req.named_digest.name)
         .await
         .with_context(|| format!("Error opening file `{}`", req.named_digest.name))
