@@ -1266,54 +1266,70 @@ where
     BytRet: Stream<Item = Result<ReadResponse, tonic::Status>> + Send,
     Cas: Future<Output = anyhow::Result<BatchReadBlobsResponse>> + Send,
 {
-    let inlined_digests = request.inlined_digests.unwrap_or_default();
-    let file_digests = request.file_digests.unwrap_or_default();
-
-    // Helper: create bytestream reader with decompression
-    let make_reader = |digest: &TDigest| {
-        let prefix = instance_name.as_resource_prefix();
-        let name = match bystream_compressor {
-            Some(c) => format!(
+    fn resource_name(
+        instance_name: &InstanceName,
+        compressor: Option<Compressor>,
+        digest: &TDigest,
+    ) -> String {
+        if let Some(compressor) = compressor {
+            format!(
                 "{}compressed-blobs/{}/{}/{}",
-                prefix,
-                c.name(),
+                instance_name.as_resource_prefix(),
+                compressor.name(),
                 digest.hash,
-                digest.size_in_bytes
-            ),
-            None => format!("{}blobs/{}/{}", prefix, digest.hash, digest.size_in_bytes),
-        };
-        async move {
-            let stream = bystream_fut(ReadRequest {
-                resource_name: name.clone(),
-                read_offset: 0,
-                read_limit: 0,
-            })
-            .await
-            .with_context(|| format!("Failed to read {name}"))?;
+                digest.size_in_bytes,
+            )
+        } else {
+            format!(
+                "{}blobs/{}/{}",
+                instance_name.as_resource_prefix(),
+                digest.hash,
+                digest.size_in_bytes,
+            )
+        }
+    }
+
+    let bystream_fut = |digest: TDigest| async move {
+        let resource_name = resource_name(&instance_name, bystream_compressor, &digest);
+
+        bystream_fut(ReadRequest {
+            resource_name: resource_name.clone(),
+            read_offset: 0,
+            read_limit: 0,
+        })
+        .await
+        // adapt the tokio Stream of ReadResponse into a StreamReader
+        .map(|p| {
             let blob_reader = StreamReader::new(
-                stream.map(|r| r.map(|rr| Cursor::new(rr.data)).map_err(io::Error::other)),
+                p.map(|r| r.map(|rr| Cursor::new(rr.data)).map_err(io::Error::other)),
             );
+            // Wrap the blob reader in a compression reader
             let reader: Pin<Box<dyn AsyncRead + Unpin + Send>> = match bystream_compressor {
                 None => Pin::new(Box::new(blob_reader)),
                 Some(Compressor::Zstd) => {
-                    let mut d = ZstdDecoder::new(blob_reader);
-                    d.multiple_members(true);
-                    Pin::new(Box::new(d))
+                    let mut decoder = ZstdDecoder::new(blob_reader);
+                    decoder.multiple_members(true);
+                    Pin::new(Box::new(decoder))
                 }
                 Some(Compressor::Deflate) => {
-                    let mut d = DeflateDecoder::new(blob_reader);
-                    d.multiple_members(true);
-                    Pin::new(Box::new(d))
+                    let mut decoder = DeflateDecoder::new(blob_reader);
+                    decoder.multiple_members(true);
+                    Pin::new(Box::new(decoder))
                 }
                 Some(Compressor::Brotli) => {
-                    let mut d = BrotliDecoder::new(blob_reader);
-                    d.multiple_members(true);
-                    Pin::new(Box::new(d))
+                    let mut decoder = BrotliDecoder::new(blob_reader);
+                    decoder.multiple_members(true);
+                    Pin::new(Box::new(decoder))
                 }
             };
-            anyhow::Ok(reader)
-        }
+
+            reader
+        })
+        .with_context(|| format!("Failed to read {resource_name} from Bytestream service"))
     };
+
+    let inlined_digests = request.inlined_digests.unwrap_or_default();
+    let file_digests = request.file_digests.unwrap_or_default();
 
     let is_large = |size: i64| size as usize >= max_total_batch_size;
 
@@ -1400,7 +1416,7 @@ where
             let digest = &req.named_digest.digest;
             let name = &req.named_digest.name;
             let mut file = open_file(req).await?;
-            let mut reader = make_reader(digest).await?;
+            let mut reader = bystream_fut(digest.clone()).await?;
             tokio::io::copy(&mut reader, &mut file)
                 .await
                 .with_context(|| format!("Error writing `{digest}` to `{name}`"))?;
@@ -1415,7 +1431,7 @@ where
         .iter()
         .filter(|d| is_large(d.size_in_bytes))
         .map(|digest| async {
-            let mut reader = make_reader(digest).await?;
+            let mut reader = bystream_fut(digest.clone()).await?;
             let mut data = Vec::new();
             tokio::io::copy(&mut reader, &mut data).await?;
             anyhow::Ok((digest.clone(), data))
