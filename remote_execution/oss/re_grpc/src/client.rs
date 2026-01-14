@@ -924,7 +924,6 @@ impl REClient {
         metadata: RemoteExecutionMetadata,
         request: DownloadRequest,
     ) -> anyhow::Result<DownloadResponse> {
-        // log::error!("{:?}", request);
         download_impl(
             &self.instance_name,
             request,
@@ -1318,7 +1317,7 @@ where
 
     let is_large = |size: i64| size as usize >= max_total_batch_size;
 
-    // Group small FILES into batches (each batch fetches + writes its files)
+    // Group small files
     let small_files: Vec<_> = file_digests
         .iter()
         .filter(|r| {
@@ -1330,7 +1329,7 @@ where
         r.named_digest.digest.size_in_bytes
     });
 
-    // Group small INLINED digests into batches (each batch fetches + returns data)
+    // Group small inlined requests
     let small_inlined: Vec<_> = inlined_digests
         .iter()
         .filter(|d| d.size_in_bytes > 0 && !is_large(d.size_in_bytes))
@@ -1338,7 +1337,7 @@ where
     let inlined_batches =
         group_into_batches(&small_inlined, max_total_batch_size, |d| d.size_in_bytes);
 
-    // Each file batch: fetch digests, then write all files immediately
+    // Make futures to request and write files
     let file_batch_futs = file_batches.into_iter().map(|batch| {
         let req = BatchReadBlobsRequest {
             instance_name: instance_name.as_str().to_owned(),
@@ -1360,17 +1359,24 @@ where
                 })
                 .collect::<anyhow::Result<_>>()?;
             for file_req in batch {
+                let digest = &file_req.named_digest.digest;
+                let name = &file_req.named_digest.name;
+                let bytes = data
+                    .get(digest)
+                    .with_context(|| format!("Did not receive digest data for `{digest}`"))?;
                 let mut file = open_file(file_req).await?;
-                if let Some(bytes) = data.get(&file_req.named_digest.digest) {
-                    file.write_all(bytes).await?;
-                }
-                file.flush().await?;
+                file.write_all(bytes)
+                    .await
+                    .with_context(|| format!("Error writing `{digest}` to `{name}`"))?;
+                file.flush()
+                    .await
+                    .with_context(|| format!("Error flushing `{name}`"))?;
             }
             anyhow::Ok(())
         }
     });
 
-    // Each inlined batch: fetch digests, return the data
+    // Each inlined batch
     let inlined_batch_futs = inlined_batches.into_iter().map(|batch| {
         let req = BatchReadBlobsRequest {
             instance_name: instance_name.as_str().to_owned(),
@@ -1390,19 +1396,25 @@ where
         }
     });
 
-    // Large files: stream directly to disk
+    // Large files
     let large_file_futs = file_digests
         .iter()
         .filter(|r| is_large(r.named_digest.digest.size_in_bytes))
         .map(|req| async {
+            let digest = &req.named_digest.digest;
+            let name = &req.named_digest.name;
             let mut file = open_file(req).await?;
-            let mut reader = make_reader(&req.named_digest.digest).await?;
-            tokio::io::copy(&mut reader, &mut file).await?;
-            file.flush().await?;
+            let mut reader = make_reader(digest).await?;
+            tokio::io::copy(&mut reader, &mut file)
+                .await
+                .with_context(|| format!("Error writing `{digest}` to `{name}`"))?;
+            file.flush()
+                .await
+                .with_context(|| format!("Error flushing `{name}`"))?;
             anyhow::Ok(())
         });
 
-    // Large inlined: stream to memory
+    // Large inlined
     let large_inlined_futs = inlined_digests
         .iter()
         .filter(|d| is_large(d.size_in_bytes))
@@ -1413,22 +1425,20 @@ where
             anyhow::Ok((digest.clone(), data))
         });
 
-    // Empty files: just create them
-    let empty_file_futs = file_digests
+    // Empty files
+    for req in file_digests
         .iter()
         .filter(|r| r.named_digest.digest.size_in_bytes == 0)
-        .map(|req| async {
-            open_file(req).await?;
-            anyhow::Ok(())
-        });
+    {
+        open_file(req).await?;
+    }
 
-    // Run ALL futures simultaneously
-    let (_, inlined_batch_results, large_inlined_results, _, _) = futures::future::try_join5(
+    // Download everything
+    let (_, inlined_batch_results, large_inlined_results, _) = futures::future::try_join4(
         futures::future::try_join_all(file_batch_futs),
         futures::future::try_join_all(inlined_batch_futs),
         futures::future::try_join_all(large_inlined_futs),
         futures::future::try_join_all(large_file_futs),
-        futures::future::try_join_all(empty_file_futs),
     )
     .await?;
 
@@ -1494,15 +1504,12 @@ fn group_into_batches<T: Clone, F: Fn(&T) -> i64>(
 
 async fn open_file(req: &NamedDigestWithPermissions) -> anyhow::Result<tokio::fs::File> {
     let mut opts = OpenOptions::new();
-    opts.read(true).write(true).create_new(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(if req.is_executable { 0o755 } else { 0o644 });
-    }
+    opts.mode(if req.is_executable { 0o755 } else { 0o644 });
     opts.open(&req.named_digest.name)
         .await
-        .context("Error opening file")
+        .with_context(|| format!("Error opening file `{}`", req.named_digest.name))
 }
 
 async fn upload_impl<Byt, Cas>(
