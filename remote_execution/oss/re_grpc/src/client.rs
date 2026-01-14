@@ -1317,7 +1317,7 @@ where
 
     let is_large = |size: i64| size as usize >= max_total_batch_size;
 
-    // Group small files
+    // Batches of small files
     let small_files: Vec<_> = file_digests
         .iter()
         .filter(|r| {
@@ -1328,16 +1328,6 @@ where
     let file_batches = group_into_batches(&small_files, max_total_batch_size, |r| {
         r.named_digest.digest.size_in_bytes
     });
-
-    // Group small inlined requests
-    let small_inlined: Vec<_> = inlined_digests
-        .iter()
-        .filter(|d| d.size_in_bytes > 0 && !is_large(d.size_in_bytes))
-        .collect();
-    let inlined_batches =
-        group_into_batches(&small_inlined, max_total_batch_size, |d| d.size_in_bytes);
-
-    // Make futures to request and write files
     let file_batch_futs = file_batches.into_iter().map(|batch| {
         let req = BatchReadBlobsRequest {
             instance_name: instance_name.as_str().to_owned(),
@@ -1376,7 +1366,13 @@ where
         }
     });
 
-    // Each inlined batch
+    // Inlined small files
+    let small_inlined: Vec<_> = inlined_digests
+        .iter()
+        .filter(|d| d.size_in_bytes > 0 && !is_large(d.size_in_bytes))
+        .collect();
+    let inlined_batches =
+        group_into_batches(&small_inlined, max_total_batch_size, |d| d.size_in_bytes);
     let inlined_batch_futs = inlined_batches.into_iter().map(|batch| {
         let req = BatchReadBlobsRequest {
             instance_name: instance_name.as_str().to_owned(),
