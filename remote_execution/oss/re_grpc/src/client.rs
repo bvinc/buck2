@@ -29,9 +29,11 @@ use async_compression::tokio::bufread::ZstdEncoder;
 use buck2_re_configuration::Buck2OssReConfiguration;
 use buck2_re_configuration::HttpHeader;
 use dupe::Dupe;
+use futures::FutureExt;
 use futures::Stream;
 use futures::future::BoxFuture;
 use futures::future::Future;
+use futures::future::Shared;
 use futures::stream::BoxStream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
@@ -79,6 +81,7 @@ use re_grpc_proto::google::rpc::Code;
 use re_grpc_proto::google::rpc::Status;
 use regex::Regex;
 use tokio::fs::OpenOptions;
+use tokio::sync::oneshot;
 use tokio::io::AsyncBufRead;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -585,6 +588,50 @@ impl FindMissingCache {
     }
 }
 
+type DedupResult = Result<(), Arc<anyhow::Error>>;
+type DownloadDedupFuture = Shared<oneshot::Receiver<DedupResult>>;
+
+/// Guard that cleans up dedup map entries and signals waiters.
+///
+/// On normal completion, `complete()` removes map entries and sends the result
+/// to all waiters. On cancellation (drop without calling `complete()`), it
+/// removes map entries and drops senders so waiters get `RecvError`.
+struct DedupCleanupGuard<'a> {
+    dedup: &'a Mutex<HashMap<String, DownloadDedupFuture>>,
+    entries: Vec<(String, oneshot::Sender<DedupResult>)>,
+}
+
+impl<'a> DedupCleanupGuard<'a> {
+    fn new(dedup: &'a Mutex<HashMap<String, DownloadDedupFuture>>) -> Self {
+        Self {
+            dedup,
+            entries: Vec::new(),
+        }
+    }
+
+    fn complete(mut self, result: anyhow::Result<()>) {
+        let result = result.map_err(|e| Arc::new(e));
+        let mut map = self.dedup.lock().unwrap();
+        for (path, sender) in self.entries.drain(..) {
+            map.remove(&path);
+            let _ = sender.send(result.clone());
+        }
+        // entries is now empty, so Drop will be a no-op
+    }
+}
+
+impl Drop for DedupCleanupGuard<'_> {
+    fn drop(&mut self) {
+        if !self.entries.is_empty() {
+            let mut map = self.dedup.lock().unwrap();
+            for (path, _sender) in self.entries.drain(..) {
+                map.remove(&path);
+                // sender is dropped, waiters get RecvError
+            }
+        }
+    }
+}
+
 pub struct REClient {
     runtime_opts: RERuntimeOpts,
     grpc_clients: GRPCClients,
@@ -593,6 +640,8 @@ pub struct REClient {
     // buck2 calls find_missing for same blobs
     find_missing_cache: Mutex<FindMissingCache>,
     bystream_compressor: Option<Compressor>,
+    /// Deduplicates concurrent downloads to the same file path.
+    download_dedup: Mutex<HashMap<String, DownloadDedupFuture>>,
 }
 
 impl Drop for REClient {
@@ -675,6 +724,7 @@ impl REClient {
                 last_check: Instant::now(),
             }),
             bystream_compressor,
+            download_dedup: Mutex::new(HashMap::new()),
         }
     }
 
@@ -930,9 +980,43 @@ impl REClient {
         metadata: RemoteExecutionMetadata,
         request: DownloadRequest,
     ) -> anyhow::Result<DownloadResponse> {
-        download_impl(
+        // Partition file_digests into files we need to download vs files already
+        // being downloaded by another concurrent call.
+        let file_digests = request.file_digests.unwrap_or_default();
+        let mut to_download = Vec::new();
+        let mut to_wait: Vec<(String, DownloadDedupFuture)> = Vec::new();
+        let mut guard = DedupCleanupGuard::new(&self.download_dedup);
+
+        {
+            let mut dedup_map = self.download_dedup.lock().unwrap();
+            for file_req in file_digests {
+                let path = file_req.named_digest.name.clone();
+                if let Some(existing_fut) = dedup_map.get(&path) {
+                    // Another download is already in progress for this path.
+                    to_wait.push((path, existing_fut.clone()));
+                } else {
+                    // We own this download. Insert a shared future for waiters.
+                    let (tx, rx) = oneshot::channel();
+                    let shared = rx.shared();
+                    dedup_map.insert(path.clone(), shared);
+                    guard.entries.push((path, tx));
+                    to_download.push(file_req);
+                }
+            }
+        }
+
+        // Download the files we own.
+        let download_result = download_impl(
             &self.instance_name,
-            request,
+            DownloadRequest {
+                inlined_digests: request.inlined_digests,
+                file_digests: if to_download.is_empty() {
+                    None
+                } else {
+                    Some(to_download)
+                },
+                _dot_dot: (),
+            },
             self.bystream_compressor,
             self.capabilities.max_total_batch_size,
             |re_request| async {
@@ -963,7 +1047,37 @@ impl REClient {
                 }
             },
         )
-        .await
+        .await;
+
+        // Signal all waiters with the result, and clean up the dedup map.
+        guard.complete(download_result.as_ref().map(|_| ()).map_err(|e| {
+            anyhow::anyhow!("{:#}", e)
+        }));
+
+        // If our own download failed, return the error.
+        let response = download_result?;
+
+        // Wait for any files that were already being downloaded by other calls.
+        for (path, fut) in to_wait {
+            match fut.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Err(anyhow::anyhow!(
+                        "Concurrent download of `{}` failed: {:#}",
+                        path,
+                        e
+                    ));
+                }
+                Err(_recv_err) => {
+                    return Err(anyhow::anyhow!(
+                        "Concurrent download of `{}` was cancelled",
+                        path,
+                    ));
+                }
+            }
+        }
+
+        Ok(response)
     }
 
     pub async fn get_digests_ttl(
