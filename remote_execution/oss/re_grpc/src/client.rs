@@ -29,6 +29,7 @@ use async_compression::tokio::bufread::ZstdEncoder;
 use buck2_re_configuration::Buck2OssReConfiguration;
 use buck2_re_configuration::HttpHeader;
 use dupe::Dupe;
+use futures::SinkExt;
 use futures::Stream;
 use futures::future::BoxFuture;
 use futures::future::Future;
@@ -882,19 +883,16 @@ impl REClient {
                     .await?;
                 Ok(resp.into_inner())
             },
-            |segments| async {
+            |rx| {
                 let metadata = metadata.clone();
                 let mut bytestream_client = self.grpc_clients.bytestream_client.clone();
-                let requests = futures::stream::iter(segments);
-                let resp = bytestream_client
-                    .write(with_re_metadata(
-                        requests,
-                        metadata,
-                        self.runtime_opts.use_fbcode_metadata,
-                    ))
-                    .await?;
-
-                Ok(resp.into_inner())
+                let use_fbcode_metadata = self.runtime_opts.use_fbcode_metadata;
+                async move {
+                    let resp = bytestream_client
+                        .write(with_re_metadata(rx, metadata, use_fbcode_metadata))
+                        .await?;
+                    Ok(resp.into_inner())
+                }
             },
         )
         .await
@@ -1477,7 +1475,10 @@ async fn upload_impl<Byt, Cas>(
     max_total_batch_size: usize,
     max_concurrent_uploads: Option<usize>,
     cas_f: impl Fn(BatchUpdateBlobsRequest) -> Cas + Sync + Send + Copy,
-    bystream_fut: impl Fn(Vec<WriteRequest>) -> Byt + Sync + Send + Copy,
+    bystream_fut: impl Fn(futures::channel::mpsc::Receiver<WriteRequest>) -> Byt
+        + Sync
+        + Send
+        + Copy,
 ) -> anyhow::Result<UploadResponse>
 where
     Cas: Future<Output = anyhow::Result<BatchUpdateBlobsResponse>> + Send,
@@ -1516,7 +1517,8 @@ where
     // https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto#L205
     let mut batched_blob_updates = BatchUploadReqAggregator::new(max_total_batch_size);
 
-    // Adapt the given bystream_fut to take in an AsyncBufRead
+    // Adapt the given bystream_fut to take in an AsyncBufRead.
+    // Streams chunks lazily via a channel so only O(chunk_size) memory is used.
     let bystream_fut = |resource_name: String, reader: Box<dyn AsyncBufRead + Unpin + Send>| async move {
         let mut reader: Pin<Box<dyn AsyncRead + Unpin + Send>> = match bystream_compressor {
             None => Pin::new(Box::new(reader)),
@@ -1525,33 +1527,48 @@ where
             Some(Compressor::Brotli) => Pin::new(Box::new(BrotliEncoder::new(reader))),
         };
 
-        let mut current_offset = 0;
-        let mut upload_segments = Vec::new();
+        // Pre-read first chunk to detect empty files.
         let mut buf = vec![0; max_total_batch_size];
-        loop {
-            let n_read = reader.read(&mut buf).await.unwrap();
-            if n_read == 0 {
-                break;
-            }
-            upload_segments.push(WriteRequest {
-                resource_name: resource_name.clone(),
-                write_offset: current_offset,
-                finish_write: false,
-                data: buf[0..n_read].to_vec(),
-            });
-            current_offset += n_read as i64;
-        }
-        if let Some(last_segment) = upload_segments.last_mut() {
-            last_segment.finish_write = true;
-        }
-
-        if upload_segments.is_empty() {
+        let first_read = reader.read(&mut buf).await.unwrap();
+        if first_read == 0 {
             // As an optimization, we can silently skip uploading empty blobs
             return Ok(());
         }
 
-        let response = bystream_fut(upload_segments).await?;
-        if response.committed_size != current_offset && response.committed_size != -1 {
+        // Spawn a producer task that reads chunks with one-chunk look-ahead
+        // (needed to set finish_write=true on the last chunk) and sends them
+        // through a channel. The bounded channel provides backpressure so only
+        // one chunk is buffered at a time.
+        let (mut tx, rx) = futures::channel::mpsc::channel(0);
+        let res_name = resource_name.clone();
+        let producer = tokio::spawn(async move {
+            let mut pending = buf[..first_read].to_vec();
+            let mut offset: i64 = 0;
+            loop {
+                let n = reader.read(&mut buf).await.unwrap();
+                let is_last = n == 0;
+                let data = std::mem::take(&mut pending);
+                if !is_last {
+                    pending = buf[..n].to_vec();
+                }
+                let len = data.len() as i64;
+                if tx.send(WriteRequest {
+                    resource_name: res_name.clone(),
+                    write_offset: offset,
+                    finish_write: is_last,
+                    data,
+                }).await.is_err() {
+                    break;
+                }
+                offset += len;
+                if is_last { break; }
+            }
+            offset
+        });
+
+        let response = bystream_fut(rx).await?;
+        let total_bytes = producer.await.unwrap();
+        if response.committed_size != total_bytes && response.committed_size != -1 {
             return Err(anyhow::anyhow!(
                 "Failed to upload `{resource_name}`: invalid committed_size from WriteResponse"
             ));
@@ -2406,7 +2423,7 @@ mod tests {
                     Ok(res)
                 }
             },
-            |_req| async { panic!("A Bytestream upload should not be triggered") },
+            |_rx| async { panic!("A Bytestream upload should not be triggered") },
         )
         .await?;
 
@@ -2487,9 +2504,10 @@ mod tests {
                     Ok(res)
                 }
             },
-            |write_reqs| {
+            |rx| {
                 let blob_data = blob_data.clone();
                 async move {
+                    let write_reqs: Vec<WriteRequest> = rx.collect().await;
                     assert_eq!(write_reqs.len(), 2);
                     assert_eq!(write_reqs[0].write_offset, 0);
                     assert!(!write_reqs[0].finish_write);
@@ -2563,9 +2581,10 @@ mod tests {
                     Ok(res)
                 }
             },
-            |write_reqs| {
+            |rx| {
                 let blob_data2 = blob_data2.clone();
                 async move {
+                    let write_reqs: Vec<WriteRequest> = rx.collect().await;
                     assert_eq!(write_reqs.len(), 2);
                     assert_eq!(write_reqs[0].write_offset, 0);
                     assert!(!write_reqs[0].finish_write);
@@ -2617,7 +2636,7 @@ mod tests {
             |_req| async move {
                 panic!("This should not be called as there are no blobs to upload in batch");
             },
-            |_write_reqs| async move {
+            |_rx| async move {
                 // Not the right size
                 anyhow::Ok(WriteResponse { committed_size: 10 })
             },
@@ -2679,7 +2698,8 @@ mod tests {
             |_req| async move {
                 panic!("Not called");
             },
-            |write_reqs| async move {
+            |rx| async move {
+                let write_reqs: Vec<WriteRequest> = rx.collect().await;
                 assert_eq!(write_reqs.len(), 2);
                 assert!(write_reqs[1].finish_write);
                 anyhow::Ok(WriteResponse { committed_size: 6 })
@@ -2726,7 +2746,7 @@ mod tests {
                     |_req| async move {
                         panic!("Not called");
                     },
-                    |_write_reqs| async move {
+                    |_rx| async move {
                         panic!("Not called");
                     },
                 )
@@ -2751,7 +2771,7 @@ mod tests {
                     |_req| async move {
                         panic!("Not called");
                     },
-                    |_write_reqs| async move {
+                    |_rx| async move {
                         panic!("Not called");
                     },
                 )
@@ -2798,7 +2818,8 @@ mod tests {
             |_req| async move {
                 panic!("Not called");
             },
-            |write_reqs| async move {
+            |rx| async move {
+                let write_reqs: Vec<WriteRequest> = rx.collect().await;
                 assert!(write_reqs[0].resource_name.starts_with("instance/uploads/"));
                 assert!(write_reqs[0].resource_name.ends_with("/blobs/aa/3"));
                 anyhow::Ok(WriteResponse { committed_size: 3 })
@@ -2845,7 +2866,8 @@ mod tests {
             |_req| async move {
                 panic!("Not called");
             },
-            |write_reqs| async move {
+            |rx| async move {
+                let write_reqs: Vec<WriteRequest> = rx.collect().await;
                 assert!(write_reqs[0].resource_name.starts_with("instance/uploads/"));
                 assert!(
                     write_reqs[0]
@@ -2915,18 +2937,17 @@ async fn test_upload_compressed() -> anyhow::Result<()> {
         |_req| async move {
             panic!("Not called");
         },
-        {
-            |write_reqs| async move {
-                let compressed_data: Vec<u8> =
-                    write_reqs.iter().flat_map(|wr| wr.data.clone()).collect();
-                let mut data = vec![];
-                ZstdDecoder::new(Cursor::new(compressed_data))
-                    .read_to_end(&mut data)
-                    .await
-                    .unwrap();
-                assert_eq!(&data, blob_data_ref);
-                anyhow::Ok(WriteResponse { committed_size: -1 })
-            }
+        |rx| async move {
+            let write_reqs: Vec<WriteRequest> = rx.collect().await;
+            let compressed_data: Vec<u8> =
+                write_reqs.iter().flat_map(|wr| wr.data.clone()).collect();
+            let mut data = vec![];
+            ZstdDecoder::new(Cursor::new(compressed_data))
+                .read_to_end(&mut data)
+                .await
+                .unwrap();
+            assert_eq!(&data, blob_data_ref);
+            anyhow::Ok(WriteResponse { committed_size: -1 })
         },
     )
     .await?;
