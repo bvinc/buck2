@@ -457,6 +457,12 @@ pub struct Buck2OssReConfiguration {
     pub grpc_keepalive_timeout_secs: Option<u64>,
     /// Whether to send HTTP/2 pings when connection is idle.
     pub grpc_keepalive_while_idle: Option<bool>,
+    /// Maximum number of retry attempts for transient gRPC failures. Set to 0 to disable retries.
+    pub grpc_retry_max_attempts: Option<u32>,
+    /// Initial backoff in milliseconds before the first retry.
+    pub grpc_retry_initial_backoff_ms: Option<u64>,
+    /// Maximum backoff in milliseconds between retries.
+    pub grpc_retry_max_backoff_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Allocative)]
@@ -573,6 +579,18 @@ impl Buck2OssReConfiguration {
             grpc_keepalive_while_idle: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "grpc_keepalive_while_idle",
+            })?,
+            grpc_retry_max_attempts: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "grpc_retry_max_attempts",
+            })?,
+            grpc_retry_initial_backoff_ms: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "grpc_retry_initial_backoff_ms",
+            })?,
+            grpc_retry_max_backoff_ms: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "grpc_retry_max_backoff_ms",
             })?,
         })
     }

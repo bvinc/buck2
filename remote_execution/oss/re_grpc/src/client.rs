@@ -100,6 +100,8 @@ use crate::error::*;
 use crate::metadata::*;
 use crate::request::*;
 use crate::response::*;
+use crate::retry::RetryConfig;
+use crate::retry::retry_grpc;
 use crate::stats::CountingConnector;
 
 const DEFAULT_MAX_TOTAL_BATCH_SIZE: usize = 4 * 1000 * 1000;
@@ -433,6 +435,14 @@ impl REClientBuilder {
             .max_decoding_message_size(max_decoding_msg_size),
         };
 
+        let retry_config = RetryConfig {
+            max_retries: opts.grpc_retry_max_attempts.unwrap_or(3),
+            initial_backoff: Duration::from_millis(
+                opts.grpc_retry_initial_backoff_ms.unwrap_or(100),
+            ),
+            max_backoff: Duration::from_millis(opts.grpc_retry_max_backoff_ms.unwrap_or(5000)),
+        };
+
         Ok(REClient::new(
             RERuntimeOpts {
                 use_fbcode_metadata: opts.use_fbcode_metadata,
@@ -445,6 +455,7 @@ impl REClientBuilder {
             capabilities,
             instance_name,
             bystream_compressor,
+            retry_config,
         ))
     }
 
@@ -593,6 +604,7 @@ pub struct REClient {
     // buck2 calls find_missing for same blobs
     find_missing_cache: Mutex<FindMissingCache>,
     bystream_compressor: Option<Compressor>,
+    retry_config: RetryConfig,
 }
 
 impl Drop for REClient {
@@ -663,6 +675,7 @@ impl REClient {
         capabilities: RECapabilities,
         instance_name: InstanceName,
         bystream_compressor: Option<Compressor>,
+        retry_config: RetryConfig,
     ) -> Self {
         REClient {
             runtime_opts,
@@ -675,6 +688,7 @@ impl REClient {
                 last_check: Instant::now(),
             }),
             bystream_compressor,
+            retry_config,
         }
     }
 
@@ -870,6 +884,7 @@ impl REClient {
             self.bystream_compressor,
             self.capabilities.max_total_batch_size,
             self.runtime_opts.max_concurrent_uploads_per_action,
+            &self.retry_config,
             |re_request| async {
                 let metadata = metadata.clone();
                 let mut cas_client = self.grpc_clients.cas_client.clone();
@@ -935,6 +950,7 @@ impl REClient {
             request,
             self.bystream_compressor,
             self.capabilities.max_total_batch_size,
+            &self.retry_config,
             |re_request| async {
                 let metadata = metadata.clone();
                 let mut client = self.grpc_clients.cas_client.clone();
@@ -1264,6 +1280,7 @@ async fn download_impl<Byt, BytRet, Cas>(
     request: DownloadRequest,
     bystream_compressor: Option<Compressor>,
     max_total_batch_size: usize,
+    retry_config: &RetryConfig,
     cas_f: impl Fn(BatchReadBlobsRequest) -> Cas,
     bystream_fut: impl Fn(ReadRequest) -> Byt + Sync + Send + Copy,
 ) -> anyhow::Result<DownloadResponse>
@@ -1378,9 +1395,11 @@ where
 
     let mut batched_blobs_response = HashMap::new();
     for read_blob_req in requests {
-        let resp = cas_f(read_blob_req)
-            .await
-            .context("Failed to make BatchReadBlobs request")?;
+        let resp = retry_grpc(retry_config, "BatchReadBlobs", || {
+            cas_f(read_blob_req.clone())
+        })
+        .await
+        .context("Failed to make BatchReadBlobs request")?;
         for r in resp.responses.into_iter() {
             let digest = tdigest_from(r.digest.context("Response digest not found.")?);
             check_status(r.status.unwrap_or_default())?;
@@ -1402,10 +1421,16 @@ where
     let mut inlined_blobs = vec![];
     for digest in inlined_digests {
         let data = if digest.size_in_bytes as usize >= max_total_batch_size {
-            let mut accum = vec![];
-            let mut reader = bystream_fut(digest.clone()).await?;
-            tokio::io::copy(&mut reader, &mut accum).await?;
-            accum
+            retry_grpc(retry_config, "BytestreamRead(inlined)", || {
+                let digest = digest.clone();
+                async move {
+                    let mut accum = vec![];
+                    let mut reader = bystream_fut(digest).await?;
+                    tokio::io::copy(&mut reader, &mut accum).await?;
+                    Ok(accum)
+                }
+            })
+            .await?
         } else {
             get(&digest)?
         };
@@ -1417,43 +1442,44 @@ where
     }
 
     let writes = file_digests.iter().map(|req| async {
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            if req.is_executable {
-                opts.mode(0o755);
-            } else {
-                opts.mode(0o644);
-            }
-        }
+        retry_grpc(retry_config, "download_file", || {
+            let name = req.named_digest.name.clone();
+            let digest = req.named_digest.digest.clone();
+            let is_executable = req.is_executable;
+            async move {
+                // Remove partially-written file from a previous attempt (ignore NotFound).
+                let _ = tokio::fs::remove_file(&name).await;
 
-        let fut = async {
-            let mut file = opts
-                .open(&req.named_digest.name)
-                .await
-                .context("Error opening")?;
+                let mut opts = OpenOptions::new();
+                opts.read(true).write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    if is_executable {
+                        opts.mode(0o755);
+                    } else {
+                        opts.mode(0o644);
+                    }
+                }
 
-            // If the data is small enough to be transferred in a batch
-            // blob update, write it all at once to the file. Otherwise, it'll
-            // be streamed in chunks as the remote responds.
-            if req.named_digest.digest.size_in_bytes < max_total_batch_size as i64 {
-                let data = get(&req.named_digest.digest)?;
-                file.write_all(&data)
-                    .await
-                    .with_context(|| format!("Error writing: {}", req.named_digest.digest))?;
-            } else {
-                let mut reader = bystream_fut(req.named_digest.digest.clone()).await?;
-                tokio::io::copy(&mut reader, &mut file)
-                    .await
-                    .with_context(|| {
-                        format!("Error writing chunk of: {}", req.named_digest.digest)
-                    })?;
+                let mut file = opts.open(&name).await.context("Error opening")?;
+
+                if digest.size_in_bytes < max_total_batch_size as i64 {
+                    let data = get(&digest)?;
+                    file.write_all(&data)
+                        .await
+                        .with_context(|| format!("Error writing: {}", digest))?;
+                } else {
+                    let mut reader = bystream_fut(digest.clone()).await?;
+                    tokio::io::copy(&mut reader, &mut file)
+                        .await
+                        .with_context(|| format!("Error writing chunk of: {}", digest))?;
+                }
+                file.flush().await.context("Error flushing")?;
+                anyhow::Ok(())
             }
-            file.flush().await.context("Error flushing")?;
-            anyhow::Ok(())
-        };
-        fut.await.with_context(|| {
+        })
+        .await
+        .with_context(|| {
             format!(
                 "Error downloading digest `{}` to `{}`",
                 req.named_digest.digest, req.named_digest.name,
@@ -1476,6 +1502,7 @@ async fn upload_impl<Byt, Cas>(
     bystream_compressor: Option<Compressor>,
     max_total_batch_size: usize,
     max_concurrent_uploads: Option<usize>,
+    retry_config: &RetryConfig,
     cas_f: impl Fn(BatchUpdateBlobsRequest) -> Cas + Sync + Send + Copy,
     bystream_fut: impl Fn(Vec<WriteRequest>) -> Byt + Sync + Send + Copy,
 ) -> anyhow::Result<UploadResponse>
@@ -1550,7 +1577,10 @@ where
             return Ok(());
         }
 
-        let response = bystream_fut(upload_segments).await?;
+        let response = retry_grpc(retry_config, "BytestreamWrite", || {
+            bystream_fut(upload_segments.clone())
+        })
+        .await?;
         if response.committed_size != current_offset && response.committed_size != -1 {
             return Err(anyhow::anyhow!(
                 "Failed to upload `{resource_name}`: invalid committed_size from WriteResponse"
@@ -1655,7 +1685,10 @@ where
                 .map(|x| x.digest.as_ref().unwrap().hash.clone())
                 .collect::<Vec<String>>();
 
-            let response = cas_f(re_request).await?;
+            let response = retry_grpc(retry_config, "BatchUpdateBlobs", || {
+                cas_f(re_request.clone())
+            })
+            .await?;
             let failures: Vec<String> = response
                 .responses
                 .iter()
@@ -1882,6 +1915,7 @@ mod tests {
             req,
             None,
             10000,
+            &RetryConfig::default(),
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -1989,6 +2023,7 @@ mod tests {
             req,
             None,
             10, // kept small to simulate a large file download
+            &RetryConfig::default(),
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2071,6 +2106,7 @@ mod tests {
             req,
             None,
             100000,
+            &RetryConfig::default(),
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2158,6 +2194,7 @@ mod tests {
             req,
             None,
             7,
+            &RetryConfig::default(),
             |req| {
                 counter.fetch_add(1, Ordering::Relaxed);
                 let res = BatchReadBlobsResponse {
@@ -2227,6 +2264,7 @@ mod tests {
             req,
             None,
             10, // intentionally small value to keep data in the test blobs small
+            &RetryConfig::default(),
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2283,6 +2321,7 @@ mod tests {
             req,
             None,
             100000,
+            &RetryConfig::default(),
             |req| {
                 let res = res.clone();
                 async move {
@@ -2322,6 +2361,7 @@ mod tests {
             req,
             None,
             0,
+            &RetryConfig::default(),
             |_req| async { panic!("not called") },
             |req| async move {
                 assert_eq!(req.resource_name, "instance/blobs/aa/0");
@@ -2393,6 +2433,7 @@ mod tests {
             None,
             10000,
             None,
+            &RetryConfig::default(),
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2477,6 +2518,7 @@ mod tests {
             None,
             10, // kept small to simulate a large file upload
             None,
+            &RetryConfig::default(),
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2552,6 +2594,7 @@ mod tests {
             None,
             10, // kept small to simulate a large inlined upload
             None,
+            &RetryConfig::default(),
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2614,6 +2657,7 @@ mod tests {
             None,
             10,
             None,
+            &RetryConfig::default(),
             |_req| async move {
                 panic!("This should not be called as there are no blobs to upload in batch");
             },
@@ -2676,6 +2720,7 @@ mod tests {
             None,
             3,
             None,
+            &RetryConfig::default(),
             |_req| async move {
                 panic!("Not called");
             },
@@ -2723,6 +2768,7 @@ mod tests {
                     compressor,
                     0, // max_total_batch_size=0 forces bytestream API
                     None,
+                    &RetryConfig::default(),
                     |_req| async move {
                         panic!("Not called");
                     },
@@ -2748,6 +2794,7 @@ mod tests {
                     compressor,
                     1024, // forces the batch API
                     None,
+                    &RetryConfig::default(),
                     |_req| async move {
                         panic!("Not called");
                     },
@@ -2795,6 +2842,7 @@ mod tests {
             None,
             1,
             None,
+            &RetryConfig::default(),
             |_req| async move {
                 panic!("Not called");
             },
@@ -2842,6 +2890,7 @@ mod tests {
             Some(Compressor::Zstd),
             1,
             None,
+            &RetryConfig::default(),
             |_req| async move {
                 panic!("Not called");
             },
@@ -2912,6 +2961,7 @@ async fn test_upload_compressed() -> anyhow::Result<()> {
         Some(Compressor::Zstd),
         1,
         None,
+        &RetryConfig::default(),
         |_req| async move {
             panic!("Not called");
         },
@@ -2958,6 +3008,7 @@ async fn test_download_compressed() -> anyhow::Result<()> {
         },
         Some(Compressor::Zstd),
         10,
+        &RetryConfig::default(),
         |_req| async { panic!("not called") },
         |_req| async move {
             Ok(Box::pin(futures::stream::iter(

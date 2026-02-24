@@ -15,6 +15,7 @@ mod grpc;
 mod metadata;
 mod request;
 mod response;
+pub mod retry;
 mod stats;
 
 use std::sync::Arc;
