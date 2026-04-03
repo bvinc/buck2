@@ -573,12 +573,12 @@ mod fbcode {
                 let (_, handle) = handlers.remove(&trace_id).unwrap();
                 match handle.await {
                     Ok(Ok(())) => {},
-                    Ok(Err(e)) => eprintln!("BES handler failed: {:#}", e),
-                    Err(e) => eprintln!("BES handler panicked: {}", e),
+                    Ok(Err(e)) => tracing::warn!("BES handler failed: {:#}", e),
+                    Err(e) => tracing::warn!("BES handler panicked: {}", e),
                 }
             }
             if let Some((send, _)) = handlers.get(&trace_id) {
-                send.send(event).unwrap_or_else(|e| eprintln!("BES send failed: {:?}", e));
+                send.send(event).unwrap_or_else(|e| tracing::warn!("BES send failed: {:?}", e));
             } else {
                 let (send, recv) = mpsc::unbounded_channel::<BuckEvent>();
                 send.send(event).expect("just-created channel cannot be closed");
@@ -593,7 +593,7 @@ mod fbcode {
                     tokio::pin!(events);
 
                     if let Some(result_uri) = result_uri.as_ref() {
-                        eprintln!("BES results: {}{}", &result_uri, &trace_id);
+                        tracing::info!("BES results: {}{}", &result_uri, &trace_id);
                     }
 
                     // Channel for feeding stream events to the gRPC streaming call.
@@ -698,12 +698,12 @@ mod fbcode {
                         .map_err(|e| anyhow::anyhow!("BES stream task panicked: {}", e))?
                         .map_err(|e| anyhow::anyhow!("BES stream RPC failed: {}", e))?;
 
-                    eprintln!(
+                    tracing::info!(
                         "BES: published {} lifecycle events ({} build + {} invocation) and {} stream events",
                         build_seq + invocation_seq, build_seq, invocation_seq, stream_seq,
                     );
                     if let Some(result_uri) = result_uri.as_ref() {
-                        eprintln!("BES results: {}{}", &result_uri, &trace_id);
+                        tracing::info!("BES results: {}{}", &result_uri, &trace_id);
                     }
                     Ok(())
                 });
