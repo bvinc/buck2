@@ -604,19 +604,37 @@ mod fbcode {
                     let mut stream_client = client.clone();
                     let response_future = stream_client.publish_build_tool_event_stream(Request::new(stream_rx));
 
-                    let mut lifecycle_seq: i64 = 0;
+                    // Sequence counters per stream. BES has three separate streams:
+                    // - Build stream: BuildEnqueued, BuildFinished (no invocation_id)
+                    // - Invocation stream: InvocationAttemptStarted, InvocationAttemptFinished
+                    // - Tool stream: all BEP events
+                    let mut build_seq: i64 = 0;
+                    let mut invocation_seq: i64 = 0;
                     let mut stream_seq: i64 = 0;
 
-                    // Helper closures for building requests.
-                    let make_lifecycle_req = |seq: i64, event: v1::BuildEvent| -> PublishLifecycleEventRequest {
+                    // StreamIds for the three streams.
+                    let build_stream_id = StreamId {
+                        build_id: trace_id.clone(),
+                        invocation_id: String::new(),
+                        component: 0, // UNKNOWN_COMPONENT
+                    };
+                    let invocation_stream_id = StreamId {
+                        build_id: trace_id.clone(),
+                        invocation_id: trace_id.clone(),
+                        component: 0, // UNKNOWN_COMPONENT
+                    };
+                    let tool_stream_id = StreamId {
+                        build_id: trace_id.clone(),
+                        invocation_id: trace_id.clone(),
+                        component: v1::stream_id::BuildComponent::Tool.into(),
+                    };
+
+                    // Helper to build a lifecycle request.
+                    let make_lifecycle_req = |seq: i64, stream_id: StreamId, event: v1::BuildEvent| -> PublishLifecycleEventRequest {
                         PublishLifecycleEventRequest {
                             service_level: 0, // NONINTERACTIVE
                             build_event: Some(OrderedBuildEvent {
-                                stream_id: Some(StreamId {
-                                    build_id: trace_id.clone(),
-                                    invocation_id: trace_id.clone(),
-                                    component: 0, // UNKNOWN_COMPONENT for lifecycle events
-                                }),
+                                stream_id: Some(stream_id),
                                 sequence_number: seq,
                                 event: Some(event),
                             }),
@@ -627,35 +645,38 @@ mod fbcode {
                         }
                     };
 
-                    let make_stream_req = |seq: i64, event: v1::BuildEvent| -> PublishBuildToolEventStreamRequest {
-                        PublishBuildToolEventStreamRequest {
-                            check_preceding_lifecycle_events_present: false,
-                            notification_keywords: vec![],
-                            ordered_build_event: Some(OrderedBuildEvent {
-                                stream_id: Some(StreamId {
-                                    build_id: trace_id.clone(),
-                                    invocation_id: trace_id.clone(),
-                                    component: v1::stream_id::BuildComponent::Tool.into(),
-                                }),
-                                sequence_number: seq,
-                                event: Some(event),
-                            }),
-                            project_id: project_id.clone(),
-                        }
-                    };
-
                     // Process events from the converter, routing by transport tag.
                     while let Some(transport_event) = events.next().await {
                         match transport_event {
                             BesTransportEvent::Lifecycle(event) => {
-                                lifecycle_seq += 1;
+                                // Route to build stream or invocation stream based on event type.
+                                let (seq, stream_id) = match event.event.as_ref() {
+                                    Some(v1::build_event::Event::BuildEnqueued(_))
+                                    | Some(v1::build_event::Event::BuildFinished(_)) => {
+                                        build_seq += 1;
+                                        (build_seq, build_stream_id.clone())
+                                    }
+                                    _ => {
+                                        invocation_seq += 1;
+                                        (invocation_seq, invocation_stream_id.clone())
+                                    }
+                                };
                                 client.publish_lifecycle_event(Request::new(
-                                    make_lifecycle_req(lifecycle_seq, event),
+                                    make_lifecycle_req(seq, stream_id, event),
                                 )).await.map_err(|e| anyhow::anyhow!("lifecycle RPC failed: {}", e))?;
                             }
                             BesTransportEvent::Stream(event) => {
                                 stream_seq += 1;
-                                let _ = stream_tx.send(make_stream_req(stream_seq, event));
+                                let _ = stream_tx.send(PublishBuildToolEventStreamRequest {
+                                    check_preceding_lifecycle_events_present: false,
+                                    notification_keywords: vec![],
+                                    ordered_build_event: Some(OrderedBuildEvent {
+                                        stream_id: Some(tool_stream_id.clone()),
+                                        sequence_number: stream_seq,
+                                        event: Some(event),
+                                    }),
+                                    project_id: project_id.clone(),
+                                });
                             }
                         }
                     }
