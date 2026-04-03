@@ -233,6 +233,24 @@ mod fbcode {
                                 match command.data.as_ref() {
                                     None => {},
                                     Some(buck2_data::command_start::Data::Build(BuildCommandStart {})) => {
+                                        // Lifecycle: BuildEnqueued
+                                        yield v1::BuildEvent {
+                                            event_time: Some(event.timestamp().into()),
+                                            event: Some(v1::build_event::Event::BuildEnqueued(
+                                                v1::build_event::BuildEnqueued { details: None },
+                                            )),
+                                        };
+                                        // Lifecycle: InvocationAttemptStarted
+                                        yield v1::BuildEvent {
+                                            event_time: Some(event.timestamp().into()),
+                                            event: Some(v1::build_event::Event::InvocationAttemptStarted(
+                                                v1::build_event::InvocationAttemptStarted {
+                                                    attempt_number: 1,
+                                                    details: None,
+                                                },
+                                            )),
+                                        };
+                                        // BEP: BuildStarted
                                         let bes_event = build_event_stream::BuildEvent {
                                             id: Some(build_event_stream::BuildEventId { id: Some(build_event_stream::build_event_id::Id::Started(build_event_stream::build_event_id::BuildStartedId {})) }),
                                             children: vec![],
@@ -393,6 +411,35 @@ mod fbcode {
                                         yield v1::BuildEvent {
                                             event_time: Some(event.timestamp().into()),
                                             event: Some(bazel_event),
+                                        };
+                                        // Lifecycle: InvocationAttemptFinished
+                                        let result = if command.is_success {
+                                            v1::build_status::Result::CommandSucceeded
+                                        } else {
+                                            v1::build_status::Result::CommandFailed
+                                        };
+                                        let status = v1::BuildStatus {
+                                            result: result.into(),
+                                            ..Default::default()
+                                        };
+                                        yield v1::BuildEvent {
+                                            event_time: Some(event.timestamp().into()),
+                                            event: Some(v1::build_event::Event::InvocationAttemptFinished(
+                                                v1::build_event::InvocationAttemptFinished {
+                                                    invocation_status: Some(status.clone()),
+                                                    details: None,
+                                                },
+                                            )),
+                                        };
+                                        // Lifecycle: BuildFinished
+                                        yield v1::BuildEvent {
+                                            event_time: Some(event.timestamp().into()),
+                                            event: Some(v1::build_event::Event::BuildFinished(
+                                                v1::build_event::BuildFinished {
+                                                    status: Some(status),
+                                                    details: None,
+                                                },
+                                            )),
                                         };
                                         break;
                                     },
@@ -665,6 +712,274 @@ mod fbcode {
         pub retry_attempts: usize,
         pub message_batch_size: Option<usize>,
         pub thrift_timeout: Duration,
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::time::SystemTime;
+
+        use futures::StreamExt;
+        use prost::Message;
+
+        use super::*;
+        use crate::BuckEvent;
+        use crate::TraceId;
+
+        // --- Input event constructors ---
+
+        fn buck_event(trace_id: &TraceId, data: buck2_data::buck_event::Data) -> BuckEvent {
+            BuckEvent::new(SystemTime::now(), trace_id.dupe(), None, None, data)
+        }
+
+        fn command_start(data: Option<buck2_data::command_start::Data>) -> buck2_data::buck_event::Data {
+            buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                data: Some(buck2_data::span_start_event::Data::Command(
+                    buck2_data::CommandStart {
+                        data,
+                        metadata: Default::default(),
+                        cli_args: vec![],
+                        tags: vec![],
+                    },
+                )),
+            })
+        }
+
+        fn build_start() -> buck2_data::buck_event::Data {
+            command_start(Some(buck2_data::command_start::Data::Build(
+                buck2_data::BuildCommandStart {},
+            )))
+        }
+
+        fn build_end(is_success: bool) -> buck2_data::buck_event::Data {
+            buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+                data: Some(buck2_data::span_end_event::Data::Command(
+                    buck2_data::CommandEnd {
+                        data: Some(buck2_data::command_end::Data::Build(
+                            buck2_data::BuildCommandEnd {
+                                unresolved_target_patterns: vec![],
+                            },
+                        )),
+                        is_success,
+                        build_result: None,
+                    },
+                )),
+                stats: None,
+                duration: None,
+            })
+        }
+
+        fn instant_event() -> buck2_data::buck_event::Data {
+            buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent { data: None })
+        }
+
+        // --- Output matching ---
+
+        /// Describes what we expect a BES output event to look like.
+        #[derive(Debug)]
+        enum ExpectedBesEvent {
+            // Lifecycle events (v1::BuildEvent variants)
+            BuildEnqueued,
+            InvocationAttemptStarted,
+            InvocationAttemptFinished,
+            LifecycleBuildFinished,
+            // BEP events (wrapped in BazelEvent)
+            Started,
+            Finished { success: bool },
+            TargetConfigured { label: String },
+            PatternExpanded,
+            ActionCompleted { label: String },
+            TargetCompleted { label: String },
+        }
+
+        /// Assert that a BES event matches an expectation.
+        fn assert_bes_matches(actual: &v1::BuildEvent, expected: &ExpectedBesEvent) {
+            let event = actual.event.as_ref().unwrap();
+            match expected {
+                // Lifecycle events: check the v1::BuildEvent variant directly
+                ExpectedBesEvent::BuildEnqueued => {
+                    assert!(
+                        matches!(event, v1::build_event::Event::BuildEnqueued(_)),
+                        "expected BuildEnqueued, got {:?}", event,
+                    );
+                }
+                ExpectedBesEvent::InvocationAttemptStarted => {
+                    assert!(
+                        matches!(event, v1::build_event::Event::InvocationAttemptStarted(_)),
+                        "expected InvocationAttemptStarted, got {:?}", event,
+                    );
+                }
+                ExpectedBesEvent::InvocationAttemptFinished => {
+                    assert!(
+                        matches!(event, v1::build_event::Event::InvocationAttemptFinished(_)),
+                        "expected InvocationAttemptFinished, got {:?}", event,
+                    );
+                }
+                ExpectedBesEvent::LifecycleBuildFinished => {
+                    assert!(
+                        matches!(event, v1::build_event::Event::BuildFinished(_)),
+                        "expected lifecycle BuildFinished, got {:?}", event,
+                    );
+                }
+                // BEP events: decode the inner build_event_stream::BuildEvent
+                _ => {
+                    let any = match event {
+                        v1::build_event::Event::BazelEvent(any) => any,
+                        other => panic!("expected BazelEvent, got {:?}", other),
+                    };
+                    let bes = build_event_stream::BuildEvent::decode(any.value.as_slice()).unwrap();
+                    let id = bes.id.as_ref().and_then(|id| id.id.as_ref());
+                    match expected {
+                        ExpectedBesEvent::Started => {
+                            assert!(
+                                matches!(id, Some(build_event_stream::build_event_id::Id::Started(_))),
+                                "expected Started, got {:?}", id,
+                            );
+                        }
+                        ExpectedBesEvent::Finished { success } => {
+                            assert!(
+                                matches!(id, Some(build_event_stream::build_event_id::Id::BuildFinished(_))),
+                                "expected BuildFinished, got {:?}", id,
+                            );
+                            assert!(bes.last_message, "BuildFinished should be last_message");
+                            let finished = match bes.payload.as_ref().unwrap() {
+                                build_event_stream::build_event::Payload::Finished(f) => f,
+                                other => panic!("expected Finished payload, got {:?}", other),
+                            };
+                            let code = finished.exit_code.as_ref().unwrap();
+                            if *success {
+                                assert_eq!(code.code, 0);
+                            } else {
+                                assert_ne!(code.code, 0);
+                            }
+                        }
+                        ExpectedBesEvent::TargetConfigured { label } => {
+                            match id {
+                                Some(build_event_stream::build_event_id::Id::TargetConfigured(tc)) => {
+                                    assert_eq!(&tc.label, label, "TargetConfigured label mismatch");
+                                }
+                                _ => panic!("expected TargetConfigured, got {:?}", id),
+                            }
+                        }
+                        ExpectedBesEvent::PatternExpanded => {
+                            assert!(
+                                matches!(id, Some(build_event_stream::build_event_id::Id::Pattern(_))),
+                                "expected Pattern, got {:?}", id,
+                            );
+                        }
+                        ExpectedBesEvent::ActionCompleted { label } => {
+                            match id {
+                                Some(build_event_stream::build_event_id::Id::ActionCompleted(ac)) => {
+                                    assert_eq!(&ac.label, label, "ActionCompleted label mismatch");
+                                }
+                                _ => panic!("expected ActionCompleted, got {:?}", id),
+                            }
+                        }
+                        ExpectedBesEvent::TargetCompleted { label } => {
+                            match id {
+                                Some(build_event_stream::build_event_id::Id::TargetCompleted(tc)) => {
+                                    assert_eq!(&tc.label, label, "TargetCompleted label mismatch");
+                                }
+                                _ => panic!("expected TargetCompleted, got {:?}", id),
+                            }
+                        }
+                        // Lifecycle variants already handled above
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+
+        /// Run a list of input BuckEvents through the converter and assert the
+        /// output matches the expected BES events.
+        async fn check(inputs: Vec<BuckEvent>, expected: Vec<ExpectedBesEvent>) {
+            let stream = tokio_stream::iter(inputs);
+            let actual: Vec<_> = buck_to_bazel_events(stream).collect().await;
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "expected {} BES events, got {}",
+                expected.len(),
+                actual.len(),
+            );
+            for (i, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert_bes_matches(actual, expected);
+                if let Err(_) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    assert_bes_matches(actual, expected);
+                })) {
+                    panic!("BES event {} mismatch: expected {:?}", i, expected);
+                }
+            }
+        }
+
+        // ====================================================
+        // Test table: input Buck events → expected BES events
+        // ====================================================
+
+        #[tokio::test]
+        async fn test_empty_stream() {
+            check(vec![], vec![]).await;
+        }
+
+        #[tokio::test]
+        async fn test_successful_build() {
+            let t = TraceId::new();
+            check(
+                vec![
+                    buck_event(&t, build_start()),
+                    buck_event(&t, build_end(true)),
+                ],
+                vec![
+                    ExpectedBesEvent::BuildEnqueued,
+                    ExpectedBesEvent::InvocationAttemptStarted,
+                    ExpectedBesEvent::Started,
+                    ExpectedBesEvent::Finished { success: true },
+                    ExpectedBesEvent::InvocationAttemptFinished,
+                    ExpectedBesEvent::LifecycleBuildFinished,
+                ],
+            ).await;
+        }
+
+        #[tokio::test]
+        async fn test_failed_build() {
+            let t = TraceId::new();
+            check(
+                vec![
+                    buck_event(&t, build_start()),
+                    buck_event(&t, build_end(false)),
+                ],
+                vec![
+                    ExpectedBesEvent::BuildEnqueued,
+                    ExpectedBesEvent::InvocationAttemptStarted,
+                    ExpectedBesEvent::Started,
+                    ExpectedBesEvent::Finished { success: false },
+                    ExpectedBesEvent::InvocationAttemptFinished,
+                    ExpectedBesEvent::LifecycleBuildFinished,
+                ],
+            ).await;
+        }
+
+        #[tokio::test]
+        async fn test_non_build_command_produces_nothing() {
+            let t = TraceId::new();
+            check(
+                vec![buck_event(&t, command_start(None))],
+                vec![],
+            ).await;
+        }
+
+        #[tokio::test]
+        async fn test_instant_and_record_events_produce_nothing() {
+            let t = TraceId::new();
+            check(
+                vec![
+                    buck_event(&t, instant_event()),
+                    buck_event(&t, buck2_data::buck_event::Data::Record(
+                        buck2_data::RecordEvent { data: None },
+                    )),
+                ],
+                vec![],
+            ).await;
+        }
     }
 }
 
