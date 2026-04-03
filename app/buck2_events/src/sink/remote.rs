@@ -593,16 +593,26 @@ mod fbcode {
                     tokio::pin!(events);
 
                     if let Some(result_uri) = result_uri.as_ref() {
-                        println!("BES results: {}{}", &result_uri, &trace_id);
+                        eprintln!("BES results: {}{}", &result_uri, &trace_id);
                     }
 
                     // Channel for feeding stream events to the gRPC streaming call.
                     let (stream_tx, stream_rx) = mpsc::unbounded_channel::<PublishBuildToolEventStreamRequest>();
                     let stream_rx = UnboundedReceiverStream::new(stream_rx);
 
-                    // Clone client: one for the streaming RPC, one for lifecycle RPCs.
+                    // Start the streaming RPC concurrently so it consumes events
+                    // as they are sent, rather than buffering everything.
                     let mut stream_client = client.clone();
-                    let response_future = stream_client.publish_build_tool_event_stream(Request::new(stream_rx));
+                    let stream_handle = tokio::spawn(async move {
+                        let response = stream_client
+                            .publish_build_tool_event_stream(Request::new(stream_rx))
+                            .await?;
+                        let mut inbound = response.into_inner();
+                        while let Some(_ack) = inbound.message().await? {
+                            // TODO: match ACK sequence numbers and retry on failure.
+                        }
+                        Ok::<(), tonic::Status>(())
+                    });
 
                     // Sequence counters per stream. BES has three separate streams:
                     // - Build stream: BuildEnqueued, BuildFinished (no invocation_id)
@@ -683,15 +693,17 @@ mod fbcode {
                     // Close the stream sender to signal end of stream.
                     drop(stream_tx);
 
-                    // Await the streaming RPC response and drain ACKs.
-                    let response = response_future.await?;
-                    let mut inbound = response.into_inner();
-                    while let Some(_ack) = inbound.message().await? {
-                        // TODO: Handle ACKs properly and add retry.
-                    }
+                    // Wait for the streaming RPC to finish draining ACKs.
+                    stream_handle.await
+                        .map_err(|e| anyhow::anyhow!("BES stream task panicked: {}", e))?
+                        .map_err(|e| anyhow::anyhow!("BES stream RPC failed: {}", e))?;
 
+                    eprintln!(
+                        "BES: published {} lifecycle events ({} build + {} invocation) and {} stream events",
+                        build_seq + invocation_seq, build_seq, invocation_seq, stream_seq,
+                    );
                     if let Some(result_uri) = result_uri.as_ref() {
-                        println!("BES results: {}{}", &result_uri, &trace_id);
+                        eprintln!("BES results: {}{}", &result_uri, &trace_id);
                     }
                     Ok(())
                 });
