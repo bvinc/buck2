@@ -428,7 +428,7 @@ mod fbcode {
                                 }.map(|label| format!("{}:{}", label.package, label.name));
                                 let action_id = BuildEventId {id: Some(build_event_id::Id::ActionCompleted(build_event_id::ActionCompletedId {
                                     configuration: configuration.clone(),
-                                    label: label.clone().unwrap_or("UNKOWN".to_owned()),
+                                    label: label.clone().unwrap_or("UNKNOWN".to_owned()),
                                     primary_output: "UNKNOWN".to_owned(),
                                 }))};
                                 let mnemonic = action.name.as_ref().map(|name| name.category.clone()).unwrap_or("UNKNOWN".to_owned());
