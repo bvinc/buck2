@@ -69,6 +69,7 @@ mod fbcode {
     use bazel_event_publisher_proto::google::devtools::build::v1::OrderedBuildEvent;
     use bazel_event_publisher_proto::google::devtools::build::v1::publish_build_event_client::PublishBuildEventClient;
     use bazel_event_publisher_proto::google::devtools::build::v1::PublishBuildToolEventStreamRequest;
+    use bazel_event_publisher_proto::google::devtools::build::v1::PublishLifecycleEventRequest;
     use bazel_event_publisher_proto::google::devtools::build::v1::StreamId;
 
     use prost;
@@ -219,14 +220,20 @@ mod fbcode {
         Ok(client)
     }
 
-    fn buck_to_bazel_events<S: Stream<Item = BuckEvent>>(events: S) -> impl Stream<Item = v1::BuildEvent> {
+    /// Tagged event indicating which BES RPC transport to use.
+    enum BesTransportEvent {
+        /// Sent via PublishLifecycleEvent unary RPC.
+        Lifecycle(v1::BuildEvent),
+        /// Sent via PublishBuildToolEventStream streaming RPC.
+        Stream(v1::BuildEvent),
+    }
+
+    fn buck_to_bazel_events<S: Stream<Item = BuckEvent>>(events: S) -> impl Stream<Item = BesTransportEvent> {
         let mut target_actions: HashMap<(String, String), Vec<(BuildEventId, bool)>> = HashMap::new();
         stream! {
             for await event in events {
-                //println!("EVENT {:?} {:?}", event.event.trace_id, event);
                 match event.data() {
                     buck2_data::buck_event::Data::SpanStart(start) => {
-                        //println!("START {:?}", start);
                         match start.data.as_ref() {
                             None => {},
                             Some(buck2_data::span_start_event::Data::Command(command)) => {
@@ -234,14 +241,14 @@ mod fbcode {
                                     None => {},
                                     Some(buck2_data::command_start::Data::Build(BuildCommandStart {})) => {
                                         // Lifecycle: BuildEnqueued
-                                        yield v1::BuildEvent {
+                                        yield BesTransportEvent::Lifecycle(v1::BuildEvent {
                                             event_time: Some(event.timestamp().into()),
                                             event: Some(v1::build_event::Event::BuildEnqueued(
                                                 v1::build_event::BuildEnqueued { details: None },
                                             )),
-                                        };
+                                        });
                                         // Lifecycle: InvocationAttemptStarted
-                                        yield v1::BuildEvent {
+                                        yield BesTransportEvent::Lifecycle(v1::BuildEvent {
                                             event_time: Some(event.timestamp().into()),
                                             event: Some(v1::build_event::Event::InvocationAttemptStarted(
                                                 v1::build_event::InvocationAttemptStarted {
@@ -249,7 +256,7 @@ mod fbcode {
                                                     details: None,
                                                 },
                                             )),
-                                        };
+                                        });
                                         // BEP: BuildStarted
                                         let bes_event = build_event_stream::BuildEvent {
                                             id: Some(build_event_stream::BuildEventId { id: Some(build_event_stream::build_event_id::Id::Started(build_event_stream::build_event_id::BuildStartedId {})) }),
@@ -271,10 +278,10 @@ mod fbcode {
                                             type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
                                             value: bes_event.encode_to_vec(),
                                         });
-                                        yield v1::BuildEvent {
+                                        yield BesTransportEvent::Stream(v1::BuildEvent {
                                             event_time: Some(event.timestamp().into()),
                                             event: Some(bazel_event),
-                                        };
+                                        });
                                     },
                                     Some(_) => {},
                                 }
@@ -307,10 +314,10 @@ mod fbcode {
                                             type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
                                             value: bes_event.encode_to_vec(),
                                         });
-                                        yield v1::BuildEvent {
+                                        yield BesTransportEvent::Stream(v1::BuildEvent {
                                             event_time: Some(event.timestamp().into()),
                                             event: Some(bazel_event),
-                                        };
+                                        });
 
                                         let bes_event = build_event_stream::BuildEvent {
                                             id: Some(build_event_stream::BuildEventId { id: Some(build_event_stream::build_event_id::Id::Pattern(build_event_id::PatternExpandedId {
@@ -331,10 +338,10 @@ mod fbcode {
                                             type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
                                             value: bes_event.encode_to_vec(),
                                         });
-                                        yield v1::BuildEvent {
+                                        yield BesTransportEvent::Stream(v1::BuildEvent {
                                             event_time: Some(event.timestamp().into()),
                                             event: Some(bazel_event),
-                                        };
+                                        });
                                     },
                                 }
                             },
@@ -375,10 +382,10 @@ mod fbcode {
                                                 type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
                                                 value: bes_event.encode_to_vec(),
                                             });
-                                            yield v1::BuildEvent {
+                                            yield BesTransportEvent::Stream(v1::BuildEvent {
                                                 event_time: Some(event.timestamp().into()),
                                                 event: Some(bazel_event),
-                                            };
+                                            });
                                         }
 
                                         let bes_event = build_event_stream::BuildEvent {
@@ -408,10 +415,19 @@ mod fbcode {
                                             type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
                                             value: bes_event.encode_to_vec(),
                                         });
-                                        yield v1::BuildEvent {
+                                        yield BesTransportEvent::Stream(v1::BuildEvent {
                                             event_time: Some(event.timestamp().into()),
                                             event: Some(bazel_event),
-                                        };
+                                        });
+                                        // BES: BuildComponentStreamFinished
+                                        yield BesTransportEvent::Stream(v1::BuildEvent {
+                                            event_time: Some(event.timestamp().into()),
+                                            event: Some(v1::build_event::Event::ComponentStreamFinished(
+                                                v1::build_event::BuildComponentStreamFinished {
+                                                    r#type: v1::build_event::build_component_stream_finished::FinishType::Finished.into(),
+                                                },
+                                            )),
+                                        });
                                         // Lifecycle: InvocationAttemptFinished
                                         let result = if command.is_success {
                                             v1::build_status::Result::CommandSucceeded
@@ -422,7 +438,7 @@ mod fbcode {
                                             result: result.into(),
                                             ..Default::default()
                                         };
-                                        yield v1::BuildEvent {
+                                        yield BesTransportEvent::Lifecycle(v1::BuildEvent {
                                             event_time: Some(event.timestamp().into()),
                                             event: Some(v1::build_event::Event::InvocationAttemptFinished(
                                                 v1::build_event::InvocationAttemptFinished {
@@ -430,9 +446,9 @@ mod fbcode {
                                                     details: None,
                                                 },
                                             )),
-                                        };
+                                        });
                                         // Lifecycle: BuildFinished
-                                        yield v1::BuildEvent {
+                                        yield BesTransportEvent::Lifecycle(v1::BuildEvent {
                                             event_time: Some(event.timestamp().into()),
                                             event: Some(v1::build_event::Event::BuildFinished(
                                                 v1::build_event::BuildFinished {
@@ -440,7 +456,7 @@ mod fbcode {
                                                     details: None,
                                                 },
                                             )),
-                                        };
+                                        });
                                         break;
                                     },
                                     Some(_) => {},
@@ -545,10 +561,10 @@ mod fbcode {
                                     type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
                                     value: bes_event.encode_to_vec(),
                                 });
-                                yield v1::BuildEvent {
+                                yield BesTransportEvent::Stream(v1::BuildEvent {
                                     event_time: Some(event.timestamp().into()),
                                     event: Some(bazel_event),
-                                };
+                                });
                             },
                             Some(_) => {},
                         }
@@ -564,27 +580,6 @@ mod fbcode {
         }
     }
 
-    fn stream_build_tool_events<S: Stream<Item = v1::BuildEvent>>(trace_id: String, events: S) -> impl Stream<Item = PublishBuildToolEventStreamRequest> {
-        stream::iter(1..)
-            .zip(events)
-            .map(move |(sequence_number, event)| {
-                PublishBuildToolEventStreamRequest {
-                    check_preceding_lifecycle_events_present: false,
-                    notification_keywords: vec![],
-                    ordered_build_event: Some(OrderedBuildEvent {
-                        stream_id: Some(StreamId {
-                            build_id: trace_id.clone(),
-                            invocation_id: trace_id.clone(),
-                            component: 0,
-                        }),
-                        sequence_number,
-                        event: Some(event),
-                    }),
-                    project_id: "12341234".to_owned(), // TODO: needed
-                }
-            })
-    }
-
     async fn event_sink_loop(recv: UnboundedReceiver<Vec<BuckEvent>>) -> anyhow::Result<()> {
         let mut handlers: HashMap<String, (UnboundedSender<BuckEvent>, tokio::task::JoinHandle<anyhow::Result<()>>)> = HashMap::new();
         let client = connect_build_event_server().await?;
@@ -592,32 +587,95 @@ mod fbcode {
             .flat_map(|v|stream::iter(v));
         let result_uri = std::env::var("BES_RESULT").ok();
         while let Some(event) = recv.next().await {
-            //let dbg_trace_id = event.event.trace_id.clone();
-            //println!("event_sink_loop event {:?}", &dbg_trace_id);
             if let Some((send, _)) = handlers.get(&event.event.trace_id) {
-                //println!("event_sink_loop redirect {:?}", &dbg_trace_id);
                 send.send(event).unwrap_or_else(|e| println!("build event send failed {:?}", e));
             } else {
-                //println!("event_sink_loop new handler {:?}", event.event.trace_id);
                 let (send, recv) = mpsc::unbounded_channel::<BuckEvent>();
                 let mut client = client.clone();
                 let result_uri = result_uri.clone();
-                //let dbg_trace_id = dbg_trace_id.clone();
                 let trace_id = event.event.trace_id.clone();
                 let handler = tokio::spawn(async move {
                     let recv = UnboundedReceiverStream::new(recv);
-                    let request = Request::new(stream_build_tool_events(trace_id.clone(), buck_to_bazel_events(recv)));
+                    let events = buck_to_bazel_events(recv);
+                    tokio::pin!(events);
+
                     if let Some(result_uri) = result_uri.as_ref() {
                         println!("BES results: {}{}", &result_uri, &trace_id);
                     }
-                    //println!("BES request {:?}", &dbg_trace_id);
-                    let response = client.publish_build_tool_event_stream(request).await?;
-                    //println!("BES response {:?}", &dbg_trace_id);
+
+                    // Channel for feeding stream events to the gRPC streaming call.
+                    let (stream_tx, stream_rx) = mpsc::unbounded_channel::<PublishBuildToolEventStreamRequest>();
+                    let stream_rx = UnboundedReceiverStream::new(stream_rx);
+
+                    // Clone client: one for the streaming RPC, one for lifecycle RPCs.
+                    let mut stream_client = client.clone();
+                    let response_future = stream_client.publish_build_tool_event_stream(Request::new(stream_rx));
+
+                    let mut lifecycle_seq: i64 = 0;
+                    let mut stream_seq: i64 = 0;
+
+                    // Helper closures for building requests.
+                    let make_lifecycle_req = |seq: i64, event: v1::BuildEvent| -> PublishLifecycleEventRequest {
+                        PublishLifecycleEventRequest {
+                            service_level: 0, // NONINTERACTIVE
+                            build_event: Some(OrderedBuildEvent {
+                                stream_id: Some(StreamId {
+                                    build_id: trace_id.clone(),
+                                    invocation_id: trace_id.clone(),
+                                    component: 0, // UNKNOWN_COMPONENT for lifecycle events
+                                }),
+                                sequence_number: seq,
+                                event: Some(event),
+                            }),
+                            stream_timeout: None,
+                            notification_keywords: vec![],
+                            project_id: "12341234".to_owned(), // TODO: make configurable
+                            check_preceding_lifecycle_events_present: false,
+                        }
+                    };
+
+                    let make_stream_req = |seq: i64, event: v1::BuildEvent| -> PublishBuildToolEventStreamRequest {
+                        PublishBuildToolEventStreamRequest {
+                            check_preceding_lifecycle_events_present: false,
+                            notification_keywords: vec![],
+                            ordered_build_event: Some(OrderedBuildEvent {
+                                stream_id: Some(StreamId {
+                                    build_id: trace_id.clone(),
+                                    invocation_id: trace_id.clone(),
+                                    component: v1::stream_id::BuildComponent::Tool.into(),
+                                }),
+                                sequence_number: seq,
+                                event: Some(event),
+                            }),
+                            project_id: "12341234".to_owned(), // TODO: make configurable
+                        }
+                    };
+
+                    // Process events from the converter, routing by transport tag.
+                    while let Some(transport_event) = events.next().await {
+                        match transport_event {
+                            BesTransportEvent::Lifecycle(event) => {
+                                lifecycle_seq += 1;
+                                client.publish_lifecycle_event(Request::new(
+                                    make_lifecycle_req(lifecycle_seq, event),
+                                )).await.map_err(|e| anyhow::anyhow!("lifecycle RPC failed: {}", e))?;
+                            }
+                            BesTransportEvent::Stream(event) => {
+                                stream_seq += 1;
+                                let _ = stream_tx.send(make_stream_req(stream_seq, event));
+                            }
+                        }
+                    }
+                    // Close the stream sender to signal end of stream.
+                    drop(stream_tx);
+
+                    // Await the streaming RPC response and drain ACKs.
+                    let response = response_future.await?;
                     let mut inbound = response.into_inner();
                     while let Some(_ack) = inbound.message().await? {
                         // TODO: Handle ACKs properly and add retry.
-                        //println!("ACK  {:?}", ack);
                     }
+
                     if let Some(result_uri) = result_uri.as_ref() {
                         println!("BES results: {}{}", &result_uri, &trace_id);
                     }
@@ -626,9 +684,7 @@ mod fbcode {
                 handlers.insert(event.event.trace_id.to_owned(), (send, handler));
             }
         }
-        //println!("event_sink_loop recv CLOSED");
-        // TODO: handle closure and retry.
-        // close send handles and await all handlers.
+        // Close send handles and await all handlers.
         let handlers: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = handlers.into_values().map(|(_, handler)|handler).collect();
         // TODO: handle retry.
         try_join_all(handlers).await?.into_iter().collect::<anyhow::Result<Vec<()>>>()?;
@@ -774,68 +830,107 @@ mod fbcode {
 
         // --- Output matching ---
 
-        /// Describes what we expect a BES output event to look like.
+        use super::BesTransportEvent;
+
+        /// Describes what we expect from the converter output.
+        /// Each variant is tagged with its expected transport (Lifecycle vs Stream).
         #[derive(Debug)]
-        enum ExpectedBesEvent {
-            // Lifecycle events (v1::BuildEvent variants)
+        #[allow(dead_code)]
+        enum Expected {
+            // Lifecycle events (sent via PublishLifecycleEvent unary RPC)
             BuildEnqueued,
             InvocationAttemptStarted,
             InvocationAttemptFinished,
             LifecycleBuildFinished,
-            // BEP events (wrapped in BazelEvent)
+            // BEP stream events (sent via PublishBuildToolEventStream)
             Started,
             Finished { success: bool },
             TargetConfigured { label: String },
             PatternExpanded,
             ActionCompleted { label: String },
             TargetCompleted { label: String },
+            ComponentStreamFinished,
         }
 
-        /// Assert that a BES event matches an expectation.
-        fn assert_bes_matches(actual: &v1::BuildEvent, expected: &ExpectedBesEvent) {
-            let event = actual.event.as_ref().unwrap();
+        impl Expected {
+            fn is_lifecycle(&self) -> bool {
+                matches!(
+                    self,
+                    Expected::BuildEnqueued
+                        | Expected::InvocationAttemptStarted
+                        | Expected::InvocationAttemptFinished
+                        | Expected::LifecycleBuildFinished
+                )
+            }
+        }
+
+        /// Assert that an actual BesTransportEvent matches an Expected.
+        fn assert_matches(actual: &BesTransportEvent, expected: &Expected) {
+            // Check transport tag
+            match (actual, expected.is_lifecycle()) {
+                (BesTransportEvent::Lifecycle(_), true) => {}
+                (BesTransportEvent::Stream(_), false) => {}
+                (BesTransportEvent::Lifecycle(_), false) => {
+                    panic!("expected Stream event, got Lifecycle: {:?}", expected);
+                }
+                (BesTransportEvent::Stream(_), true) => {
+                    panic!("expected Lifecycle event, got Stream: {:?}", expected);
+                }
+            }
+
+            let event = match actual {
+                BesTransportEvent::Lifecycle(e) | BesTransportEvent::Stream(e) => e,
+            };
+            let inner = event.event.as_ref().unwrap();
+
             match expected {
                 // Lifecycle events: check the v1::BuildEvent variant directly
-                ExpectedBesEvent::BuildEnqueued => {
+                Expected::BuildEnqueued => {
                     assert!(
-                        matches!(event, v1::build_event::Event::BuildEnqueued(_)),
-                        "expected BuildEnqueued, got {:?}", event,
+                        matches!(inner, v1::build_event::Event::BuildEnqueued(_)),
+                        "expected BuildEnqueued, got {:?}", inner,
                     );
                 }
-                ExpectedBesEvent::InvocationAttemptStarted => {
+                Expected::InvocationAttemptStarted => {
                     assert!(
-                        matches!(event, v1::build_event::Event::InvocationAttemptStarted(_)),
-                        "expected InvocationAttemptStarted, got {:?}", event,
+                        matches!(inner, v1::build_event::Event::InvocationAttemptStarted(_)),
+                        "expected InvocationAttemptStarted, got {:?}", inner,
                     );
                 }
-                ExpectedBesEvent::InvocationAttemptFinished => {
+                Expected::InvocationAttemptFinished => {
                     assert!(
-                        matches!(event, v1::build_event::Event::InvocationAttemptFinished(_)),
-                        "expected InvocationAttemptFinished, got {:?}", event,
+                        matches!(inner, v1::build_event::Event::InvocationAttemptFinished(_)),
+                        "expected InvocationAttemptFinished, got {:?}", inner,
                     );
                 }
-                ExpectedBesEvent::LifecycleBuildFinished => {
+                Expected::LifecycleBuildFinished => {
                     assert!(
-                        matches!(event, v1::build_event::Event::BuildFinished(_)),
-                        "expected lifecycle BuildFinished, got {:?}", event,
+                        matches!(inner, v1::build_event::Event::BuildFinished(_)),
+                        "expected lifecycle BuildFinished, got {:?}", inner,
+                    );
+                }
+                Expected::ComponentStreamFinished => {
+                    assert!(
+                        matches!(inner, v1::build_event::Event::ComponentStreamFinished(_)),
+                        "expected ComponentStreamFinished, got {:?}", inner,
                     );
                 }
                 // BEP events: decode the inner build_event_stream::BuildEvent
                 _ => {
-                    let any = match event {
+                    let any = match inner {
                         v1::build_event::Event::BazelEvent(any) => any,
                         other => panic!("expected BazelEvent, got {:?}", other),
                     };
                     let bes = build_event_stream::BuildEvent::decode(any.value.as_slice()).unwrap();
                     let id = bes.id.as_ref().and_then(|id| id.id.as_ref());
                     match expected {
-                        ExpectedBesEvent::Started => {
+                        Expected::Started => {
                             assert!(
                                 matches!(id, Some(build_event_stream::build_event_id::Id::Started(_))),
                                 "expected Started, got {:?}", id,
                             );
                         }
-                        ExpectedBesEvent::Finished { success } => {
+                        Expected::Finished { success } => {
                             assert!(
                                 matches!(id, Some(build_event_stream::build_event_id::Id::BuildFinished(_))),
                                 "expected BuildFinished, got {:?}", id,
@@ -852,7 +947,7 @@ mod fbcode {
                                 assert_ne!(code.code, 0);
                             }
                         }
-                        ExpectedBesEvent::TargetConfigured { label } => {
+                        Expected::TargetConfigured { label } => {
                             match id {
                                 Some(build_event_stream::build_event_id::Id::TargetConfigured(tc)) => {
                                     assert_eq!(&tc.label, label, "TargetConfigured label mismatch");
@@ -860,13 +955,13 @@ mod fbcode {
                                 _ => panic!("expected TargetConfigured, got {:?}", id),
                             }
                         }
-                        ExpectedBesEvent::PatternExpanded => {
+                        Expected::PatternExpanded => {
                             assert!(
                                 matches!(id, Some(build_event_stream::build_event_id::Id::Pattern(_))),
                                 "expected Pattern, got {:?}", id,
                             );
                         }
-                        ExpectedBesEvent::ActionCompleted { label } => {
+                        Expected::ActionCompleted { label } => {
                             match id {
                                 Some(build_event_stream::build_event_id::Id::ActionCompleted(ac)) => {
                                     assert_eq!(&ac.label, label, "ActionCompleted label mismatch");
@@ -874,7 +969,7 @@ mod fbcode {
                                 _ => panic!("expected ActionCompleted, got {:?}", id),
                             }
                         }
-                        ExpectedBesEvent::TargetCompleted { label } => {
+                        Expected::TargetCompleted { label } => {
                             match id {
                                 Some(build_event_stream::build_event_id::Id::TargetCompleted(tc)) => {
                                     assert_eq!(&tc.label, label, "TargetCompleted label mismatch");
@@ -882,7 +977,6 @@ mod fbcode {
                                 _ => panic!("expected TargetCompleted, got {:?}", id),
                             }
                         }
-                        // Lifecycle variants already handled above
                         _ => unreachable!(),
                     }
                 }
@@ -890,24 +984,19 @@ mod fbcode {
         }
 
         /// Run a list of input BuckEvents through the converter and assert the
-        /// output matches the expected BES events.
-        async fn check(inputs: Vec<BuckEvent>, expected: Vec<ExpectedBesEvent>) {
+        /// output matches the expected events (both lifecycle and stream).
+        async fn check(inputs: Vec<BuckEvent>, expected: Vec<Expected>) {
             let stream = tokio_stream::iter(inputs);
             let actual: Vec<_> = buck_to_bazel_events(stream).collect().await;
             assert_eq!(
                 actual.len(),
                 expected.len(),
-                "expected {} BES events, got {}",
+                "expected {} events, got {}",
                 expected.len(),
                 actual.len(),
             );
-            for (i, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
-                assert_bes_matches(actual, expected);
-                if let Err(_) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    assert_bes_matches(actual, expected);
-                })) {
-                    panic!("BES event {} mismatch: expected {:?}", i, expected);
-                }
+            for (actual, expected) in actual.iter().zip(expected.iter()) {
+                assert_matches(actual, expected);
             }
         }
 
@@ -929,12 +1018,13 @@ mod fbcode {
                     buck_event(&t, build_end(true)),
                 ],
                 vec![
-                    ExpectedBesEvent::BuildEnqueued,
-                    ExpectedBesEvent::InvocationAttemptStarted,
-                    ExpectedBesEvent::Started,
-                    ExpectedBesEvent::Finished { success: true },
-                    ExpectedBesEvent::InvocationAttemptFinished,
-                    ExpectedBesEvent::LifecycleBuildFinished,
+                    Expected::BuildEnqueued,
+                    Expected::InvocationAttemptStarted,
+                    Expected::Started,
+                    Expected::Finished { success: true },
+                    Expected::ComponentStreamFinished,
+                    Expected::InvocationAttemptFinished,
+                    Expected::LifecycleBuildFinished,
                 ],
             ).await;
         }
@@ -948,12 +1038,13 @@ mod fbcode {
                     buck_event(&t, build_end(false)),
                 ],
                 vec![
-                    ExpectedBesEvent::BuildEnqueued,
-                    ExpectedBesEvent::InvocationAttemptStarted,
-                    ExpectedBesEvent::Started,
-                    ExpectedBesEvent::Finished { success: false },
-                    ExpectedBesEvent::InvocationAttemptFinished,
-                    ExpectedBesEvent::LifecycleBuildFinished,
+                    Expected::BuildEnqueued,
+                    Expected::InvocationAttemptStarted,
+                    Expected::Started,
+                    Expected::Finished { success: false },
+                    Expected::ComponentStreamFinished,
+                    Expected::InvocationAttemptFinished,
+                    Expected::LifecycleBuildFinished,
                 ],
             ).await;
         }
