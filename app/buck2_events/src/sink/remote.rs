@@ -567,15 +567,27 @@ mod fbcode {
         let result_uri = config.result_url.clone();
         let project_id = config.project_id.clone();
         while let Some(event) = recv.next().await {
-            if let Some((send, _)) = handlers.get(&event.event.trace_id) {
-                send.send(event).unwrap_or_else(|e| println!("build event send failed {:?}", e));
+            let trace_id = event.event.trace_id.clone();
+            // Check if an existing handler has failed and clean it up.
+            if handlers.get(&trace_id).is_some_and(|(_, h)| h.is_finished()) {
+                let (_, handle) = handlers.remove(&trace_id).unwrap();
+                match handle.await {
+                    Ok(Ok(())) => {},
+                    Ok(Err(e)) => eprintln!("BES handler failed: {:#}", e),
+                    Err(e) => eprintln!("BES handler panicked: {}", e),
+                }
+            }
+            if let Some((send, _)) = handlers.get(&trace_id) {
+                send.send(event).unwrap_or_else(|e| eprintln!("BES send failed: {:?}", e));
             } else {
                 let (send, recv) = mpsc::unbounded_channel::<BuckEvent>();
+                send.send(event).expect("just-created channel cannot be closed");
                 let mut client = client.clone();
                 let result_uri = result_uri.clone();
                 let project_id = project_id.clone();
-                let trace_id = event.event.trace_id.clone();
+                let handler_trace_id = trace_id.clone();
                 let handler = tokio::spawn(async move {
+                    let trace_id = handler_trace_id;
                     let recv = UnboundedReceiverStream::new(recv);
                     let events = buck_to_bazel_events(recv);
                     tokio::pin!(events);
@@ -662,7 +674,7 @@ mod fbcode {
                     }
                     Ok(())
                 });
-                handlers.insert(event.event.trace_id.to_owned(), (send, handler));
+                handlers.insert(trace_id, (send, handler));
             }
         }
         // Close send handles and await all handlers.
