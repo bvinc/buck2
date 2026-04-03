@@ -238,7 +238,7 @@ mod imp {
             return;
         }
 
-        let sink = match new_remote_event_sink_if_enabled(fb, ScribeConfig::default()) {
+        let sink = match new_remote_event_sink_if_enabled(fb, ScribeConfig::default(), None) {
             #[allow(unreachable_patterns)]
             Ok(Some(sink)) => sink,
             _ => {

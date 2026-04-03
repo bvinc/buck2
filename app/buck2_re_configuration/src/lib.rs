@@ -468,6 +468,14 @@ pub struct Buck2OssReConfiguration {
     pub grpc_keepalive_while_idle: Option<bool>,
     /// Maximum number of concurrent execution requests.
     pub execution_concurrency_limit: Option<usize>,
+    /// Address for the Build Event Service (BES) endpoint.
+    pub bes_address: Option<String>,
+    /// Project ID sent with BES requests.
+    pub bes_project_id: Option<String>,
+    /// URL prefix for build result links (trace ID is appended).
+    pub bes_result_url: Option<String>,
+    /// HTTP headers for BES requests. If empty, inherits `http_headers`.
+    pub bes_http_headers: Vec<HttpHeader>,
 }
 
 #[derive(Clone, Debug, Default, Allocative)]
@@ -589,6 +597,30 @@ impl Buck2OssReConfiguration {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "execution_concurrency_limit",
             })?,
+            bes_address: legacy_config
+                .parse(BuckconfigKeyRef {
+                    section: "buck2_bes",
+                    property: "address",
+                })?
+                .or_else(|| std::env::var("BES_URI").ok()),
+            bes_project_id: legacy_config
+                .parse(BuckconfigKeyRef {
+                    section: "buck2_bes",
+                    property: "project_id",
+                })?
+                .or_else(|| std::env::var("BES_PROJECT_ID").ok()),
+            bes_result_url: legacy_config
+                .parse(BuckconfigKeyRef {
+                    section: "buck2_bes",
+                    property: "result_url",
+                })?
+                .or_else(|| std::env::var("BES_RESULT").ok()),
+            bes_http_headers: legacy_config
+                .parse_list(BuckconfigKeyRef {
+                    section: "buck2_bes",
+                    property: "http_headers",
+                })?
+                .unwrap_or_default(),
         })
     }
 }

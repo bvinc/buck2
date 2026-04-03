@@ -2476,6 +2476,7 @@ impl EventSubscriber for InvocationRecorder {
                 message_batch_size: None,
                 thrift_timeout: Duration::from_secs(2),
             },
+            None,
         )? {
             tracing::info!("Recording invocation to Scribe: {:?}", &event);
             scribe_sink.send_now(event).await;

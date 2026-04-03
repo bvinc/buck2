@@ -569,7 +569,7 @@ async fn dispatch_event_to_scribe(
 fn create_scribe_sink(ctx: &ClientCommandContext) -> buck2_error::Result<Option<RemoteEventSink>> {
     // TODO(swgiillespie) scribe_logging is likely the right feature for this, but we should be able to inject a sink
     // without using configurations at the call site
-    new_remote_event_sink_if_enabled(ctx.fbinit(), ScribeConfig::default())
+    new_remote_event_sink_if_enabled(ctx.fbinit(), ScribeConfig::default(), None)
 }
 
 async fn maybe_select_invocation(

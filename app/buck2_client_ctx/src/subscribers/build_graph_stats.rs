@@ -87,6 +87,7 @@ impl BuildGraphStats {
                 message_batch_size: None,
                 thrift_timeout: Duration::from_secs(1),
             },
+            None,
         ) {
             tracing::info!("Sending events to Scribe: {:?}", &events);
             let _res = sink.send_messages_now(events).await;

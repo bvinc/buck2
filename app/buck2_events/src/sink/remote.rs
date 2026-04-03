@@ -14,6 +14,28 @@ use std::sync::atomic::Ordering;
 
 use fbinit::FacebookInit;
 
+/// HTTP header with key and value (supports env var substitution via $VAR syntax).
+#[derive(Clone, Debug)]
+pub struct HttpHeader {
+    pub key: String,
+    pub value: String,
+}
+
+/// Configuration for connecting to a Bazel Build Event Service (BES) endpoint.
+#[derive(Clone, Debug)]
+pub struct BesConfig {
+    /// BES gRPC endpoint address (e.g. "https://host:port").
+    pub address: String,
+    /// Whether to use TLS.
+    pub tls: bool,
+    /// HTTP headers to inject into requests.
+    pub http_headers: Vec<HttpHeader>,
+    /// Project ID sent with BES requests.
+    pub project_id: String,
+    /// URL prefix for build result links (trace ID is appended).
+    pub result_url: Option<String>,
+}
+
 #[cfg(fbcode_build)]
 mod fbcode {
     pub use scribe_client::ScribeConfig;
@@ -25,13 +47,10 @@ mod fbcode {
 #[cfg(not(fbcode_build))]
 mod fbcode {
     use std::collections::HashMap;
-    use std::env::VarError;
-    use std::str::FromStr;
     use std::sync::Arc;
     use std::thread::JoinHandle;
     use std::time::Duration;
 
-    use allocative::Allocative;
     use anyhow::Context;
 
     use async_stream::stream;
@@ -50,6 +69,7 @@ mod fbcode {
 
     use futures::Stream;
     use futures::StreamExt;
+    use regex::Regex;
     use tonic::metadata;
     use tonic::metadata::MetadataKey;
     use tonic::metadata::MetadataValue;
@@ -76,53 +96,22 @@ mod fbcode {
     use prost::Message;
     use prost_types;
 
-    use regex::Regex;
-
     use crate::BuckEvent;
     use crate::Event;
     use crate::EventSink;
     use crate::EventSinkStats;
     use crate::EventSinkWithStats;
 
+    use super::BesConfig;
+    use super::HttpHeader;
+
     pub struct RemoteEventSink {
         _handler: JoinHandle<()>,
         send: UnboundedSender<Vec<BuckEvent>>,
     }
 
-    // TODO[AH] re-use definitions from REOSS crate.
-    #[derive(Clone, Debug, Default, Allocative)]
-    pub struct HttpHeader {
-        pub key: String,
-        pub value: String,
-    }
-
-    impl FromStr for HttpHeader {
-        type Err = anyhow::Error;
-
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-            let mut iter = s.split(':');
-            match (iter.next(), iter.next(), iter.next()) {
-                (Some(key), Some(value), None) => Ok(Self {
-                    key: key.trim().to_owned(),
-                    value: value.trim().to_owned(),
-                }),
-                _ => Err(anyhow::anyhow!(
-                    "Invalid header (expect exactly one `:`): `{}`",
-                    s
-                )),
-            }
-        }
-    }
-
     /// Replace occurrences of $FOO in a string with the value of the env var $FOO.
     fn substitute_env_vars(s: &str) -> anyhow::Result<String> {
-        substitute_env_vars_impl(s, |v| std::env::var(v))
-    }
-
-    fn substitute_env_vars_impl(
-        s: &str,
-        getter: impl Fn(&str) -> Result<String, VarError>,
-    ) -> anyhow::Result<String> {
         static ENV_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new("\\$[a-zA-Z_][a-zA-Z_0-9]*").unwrap());
 
         let mut out = String::with_capacity(s.len());
@@ -131,7 +120,8 @@ mod fbcode {
         for mat in ENV_REGEX.find_iter(s) {
             out.push_str(&s[last_idx..mat.start()]);
             let var = &mat.as_str()[1..];
-            let val = getter(var).with_context(|| format!("Error substituting `{}`", mat.as_str()))?;
+            let val = std::env::var(var)
+                .with_context(|| format!("Error substituting `{}`", mat.as_str()))?;
             out.push_str(&val);
             last_idx = mat.end();
         }
@@ -153,9 +143,6 @@ mod fbcode {
             let headers = headers
                 .iter()
                 .map(|h| {
-                    // This means we can't have `$` in a header key or value, which isn't great. On the
-                    // flip side, env vars are good for things like credentials, which those headers
-                    // are likely to contain. In time, we should allow escaping.
                     let key = substitute_env_vars(&h.key)?;
                     let value = substitute_env_vars(&h.value)?;
 
@@ -190,32 +177,24 @@ mod fbcode {
 
     type GrpcService = InterceptedService<Channel, InjectHeadersInterceptor>;
 
-    async fn connect_build_event_server() -> anyhow::Result<PublishBuildEventClient<GrpcService>> {
-        let uri = std::env::var("BES_URI")?.parse()?;
+    async fn connect_build_event_server(
+        config: &BesConfig,
+    ) -> anyhow::Result<PublishBuildEventClient<GrpcService>> {
+        let uri = config.address.parse()?;
         let mut channel = Channel::builder(uri);
-        let tls_config = ClientTlsConfig::new().with_enabled_roots();
-        {
-            let tls_setting = std::env::var("BES_TLS").unwrap_or("0".to_owned());
-            match tls_setting.as_str() {
-                "1" | "true" => {
-                    channel = channel.tls_config(tls_config)?;
-                },
-                _ => {},
-            }
+
+        if config.tls {
+            let tls_config = ClientTlsConfig::new().with_enabled_roots();
+            // TODO: support tls_ca_certs and tls_client_cert
+            channel = channel.tls_config(tls_config)?;
         }
-        // TODO: parse PEM
+
         let endpoint = channel
             .connect()
             .await
-            .context("connecting to Bazel event stream gRPC server")?;
-        let mut headers = vec![];
-        for hdr in std::env::var("BES_HEADERS").unwrap_or("".to_owned()).split(",") {
-            let hdr = hdr.trim();
-            if !hdr.is_empty() {
-                headers.push(HttpHeader::from_str(hdr)?);
-            }
-        };
-        let interceptor = InjectHeadersInterceptor::new(&headers)?;
+            .context("connecting to BES gRPC server")?;
+
+        let interceptor = InjectHeadersInterceptor::new(&config.http_headers)?;
         let client = PublishBuildEventClient::with_interceptor(endpoint, interceptor);
         Ok(client)
     }
@@ -580,13 +559,13 @@ mod fbcode {
         }
     }
 
-    async fn event_sink_loop(recv: UnboundedReceiver<Vec<BuckEvent>>) -> anyhow::Result<()> {
+    async fn event_sink_loop(recv: UnboundedReceiver<Vec<BuckEvent>>, config: Arc<BesConfig>) -> anyhow::Result<()> {
         let mut handlers: HashMap<String, (UnboundedSender<BuckEvent>, tokio::task::JoinHandle<anyhow::Result<()>>)> = HashMap::new();
-        let client = connect_build_event_server().await?;
+        let client = connect_build_event_server(&config).await?;
         let mut recv = UnboundedReceiverStream::new(recv)
             .flat_map(|v|stream::iter(v));
-        let result_uri = std::env::var("BES_RESULT").ok();
-        let project_id = std::env::var("BES_PROJECT_ID").unwrap_or_default();
+        let result_uri = config.result_url.clone();
+        let project_id = config.project_id.clone();
         while let Some(event) = recv.next().await {
             if let Some((send, _)) = handlers.get(&event.event.trace_id) {
                 send.send(event).unwrap_or_else(|e| println!("build event send failed {:?}", e));
@@ -694,14 +673,14 @@ mod fbcode {
     }
 
     impl RemoteEventSink {
-        pub fn new() -> anyhow::Result<Self> {
+        pub fn new(config: Arc<BesConfig>) -> anyhow::Result<Self> {
             let (send, recv) = mpsc::unbounded_channel::<Vec<BuckEvent>>();
             let handler = std::thread::Builder::new()
                 .name("buck-event-producer".to_owned())
                 .spawn({
                     move || {
                         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-                        runtime.block_on(event_sink_loop(recv)).unwrap();
+                        runtime.block_on(event_sink_loop(recv, config)).unwrap();
                     }
                 }).context("spawning buck-event-producer thread")?;
             Ok(RemoteEventSink {
@@ -1081,17 +1060,21 @@ pub use fbcode::*;
 fn new_remote_event_sink_if_fbcode(
     fb: FacebookInit,
     config: ScribeConfig,
+    bes_config: Option<std::sync::Arc<BesConfig>>,
 ) -> buck2_error::Result<Option<RemoteEventSink>> {
     #[cfg(fbcode_build)]
     {
+        let _ = bes_config;
         Ok(Some(RemoteEventSink::new(fb, scribe_category()?, config)?))
     }
     #[cfg(not(fbcode_build))]
     {
         let _ = (fb, config);
-        match std::env::var("BES_URI") {
-          Ok(_) => Ok(Some(RemoteEventSink::new().map_err(|e| buck2_error::conversion::from_any_with_tag(e, buck2_error::ErrorTag::Environment))?)),
-          _ => Ok(None),
+        match bes_config {
+            Some(c) => {
+                Ok(Some(RemoteEventSink::new(c).map_err(|e| buck2_error::conversion::from_any_with_tag(e, buck2_error::ErrorTag::Environment))?))
+            }
+            _ => Ok(None),
         }
     }
 }
@@ -1099,9 +1082,10 @@ fn new_remote_event_sink_if_fbcode(
 pub fn new_remote_event_sink_if_enabled(
     fb: FacebookInit,
     config: ScribeConfig,
+    bes_config: Option<std::sync::Arc<BesConfig>>,
 ) -> buck2_error::Result<Option<RemoteEventSink>> {
     if is_enabled() {
-        new_remote_event_sink_if_fbcode(fb, config)
+        new_remote_event_sink_if_fbcode(fb, config, bes_config)
     } else {
         Ok(None)
     }

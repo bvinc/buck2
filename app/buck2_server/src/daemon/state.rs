@@ -332,6 +332,31 @@ impl DaemonState {
                 property: "event_log_message_batch_size",
             })?;
             tracing::info!("Initializing scribe sink...");
+            let bes_config = buck2_re_configuration::Buck2OssReConfiguration::from_legacy_config(
+                root_config,
+            )
+            .ok()
+            .and_then(|re_config| {
+                let address = re_config.bes_address?;
+                let http_headers = if re_config.bes_http_headers.is_empty() {
+                    &re_config.http_headers
+                } else {
+                    &re_config.bes_http_headers
+                };
+                Some(Arc::new(remote::BesConfig {
+                    address,
+                    tls: re_config.tls,
+                    http_headers: http_headers
+                        .iter()
+                        .map(|h| remote::HttpHeader {
+                            key: h.key.clone(),
+                            value: h.value.clone(),
+                        })
+                        .collect(),
+                    project_id: re_config.bes_project_id.unwrap_or_default(),
+                    result_url: re_config.bes_result_url,
+                }))
+            });
             let scribe_sink = Self::init_scribe_sink(
                 fb,
                 ScribeConfig {
@@ -341,6 +366,7 @@ impl DaemonState {
                     message_batch_size,
                     thrift_timeout: Duration::from_secs(1),
                 },
+                bes_config,
             )
             .buck_error_context("failed to init scribe sink")?;
 
@@ -769,9 +795,10 @@ impl DaemonState {
     fn init_scribe_sink(
         fb: FacebookInit,
         config: ScribeConfig,
+        bes_config: Option<Arc<remote::BesConfig>>,
     ) -> buck2_error::Result<Option<Arc<dyn EventSinkWithStats>>> {
         facebook_only();
-        remote::new_remote_event_sink_if_enabled(fb, config)
+        remote::new_remote_event_sink_if_enabled(fb, config, bes_config)
             .map(|maybe_scribe| maybe_scribe.map(|scribe| Arc::new(scribe) as _))
     }
 
