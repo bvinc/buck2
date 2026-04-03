@@ -586,6 +586,7 @@ mod fbcode {
         let mut recv = UnboundedReceiverStream::new(recv)
             .flat_map(|v|stream::iter(v));
         let result_uri = std::env::var("BES_RESULT").ok();
+        let project_id = std::env::var("BES_PROJECT_ID").unwrap_or_default();
         while let Some(event) = recv.next().await {
             if let Some((send, _)) = handlers.get(&event.event.trace_id) {
                 send.send(event).unwrap_or_else(|e| println!("build event send failed {:?}", e));
@@ -593,6 +594,7 @@ mod fbcode {
                 let (send, recv) = mpsc::unbounded_channel::<BuckEvent>();
                 let mut client = client.clone();
                 let result_uri = result_uri.clone();
+                let project_id = project_id.clone();
                 let trace_id = event.event.trace_id.clone();
                 let handler = tokio::spawn(async move {
                     let recv = UnboundedReceiverStream::new(recv);
@@ -629,7 +631,7 @@ mod fbcode {
                             }),
                             stream_timeout: None,
                             notification_keywords: vec![],
-                            project_id: "12341234".to_owned(), // TODO: make configurable
+                            project_id: project_id.clone(),
                             check_preceding_lifecycle_events_present: false,
                         }
                     };
@@ -647,7 +649,7 @@ mod fbcode {
                                 sequence_number: seq,
                                 event: Some(event),
                             }),
-                            project_id: "12341234".to_owned(), // TODO: make configurable
+                            project_id: project_id.clone(),
                         }
                     };
 
