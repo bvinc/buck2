@@ -193,7 +193,7 @@ mod fbcode {
     async fn connect_build_event_server() -> anyhow::Result<PublishBuildEventClient<GrpcService>> {
         let uri = std::env::var("BES_URI")?.parse()?;
         let mut channel = Channel::builder(uri);
-        let tls_config = ClientTlsConfig::new();
+        let tls_config = ClientTlsConfig::new().with_enabled_roots();
         {
             let tls_setting = std::env::var("BES_TLS").unwrap_or("0".to_owned());
             match tls_setting.as_str() {
