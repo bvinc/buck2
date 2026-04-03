@@ -9,6 +9,7 @@ version = "0.1.0"
 [dependencies]
 prost = { workspace = true }
 tonic = { workspace = true }
+tonic-prost = { workspace = true }
 
 buck2_data = { workspace = true }
 

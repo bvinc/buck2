@@ -7,9 +7,7 @@
  * of this source tree.
  */
 
-use std::env;
 use std::io;
-use std::path::PathBuf;
 
 fn main() -> io::Result<()> {
     let proto_files = &[
@@ -31,7 +29,7 @@ fn main() -> io::Result<()> {
         "proto/google/devtools/build/v1/publish_build_event.proto",
     ];
 
-    buck2_protoc_dev::configure()
-        .setup_protoc()
+    let builder = buck2_protoc_dev::configure();
+    unsafe { builder.setup_protoc() }
         .compile(proto_files, &["./proto/"])
 }

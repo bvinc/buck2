@@ -1643,9 +1643,7 @@ impl RemoteExecutionClientImpl {
                 // thing that it got a hit or deduplicated against.
                 let was_not_actually_executed = r
                     .execute_response
-                    .executed_action_details
-                    .was_served_from_cache
-                    || r.execute_response.executed_action_details.was_deduplicated;
+                    .cached_result;
                 let event = if was_not_actually_executed {
                     buck2_data::action_digest_trace::ActionDigestTraceEvent::CacheHit
                 } else {

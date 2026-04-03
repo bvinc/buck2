@@ -125,7 +125,7 @@ mod fbcode {
         static ENV_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new("\\$[a-zA-Z_][a-zA-Z_0-9]*").unwrap());
 
         let mut out = String::with_capacity(s.len());
-        let mut last_idx = 0;
+        let mut last_idx: usize = 0;
 
         for mat in ENV_REGEX.find_iter(s) {
             out.push_str(&s[last_idx..mat.start()]);
@@ -239,7 +239,6 @@ mod fbcode {
                                             last_message: false,
                                             payload: Some(build_event_stream::build_event::Payload::Started(build_event_stream::BuildStarted {
                                                 uuid: event.event.trace_id.clone(),
-                                                start_time_millis: 0,
                                                 start_time: Some(event.timestamp().into()),
                                                 build_tool_version: "BUCK2".to_owned(),
                                                 options_description: "UNKNOWN".to_owned(),
@@ -247,6 +246,7 @@ mod fbcode {
                                                 working_directory: "UNKNOWN".to_owned(),
                                                 workspace_directory: "UNKNOWN".to_owned(),
                                                 server_pid: std::process::id() as i64,
+                                                ..Default::default()
                                             })),
                                         };
                                         let bazel_event = v1::build_event::Event::BazelEvent(prost_types::Any {
@@ -345,15 +345,12 @@ mod fbcode {
                                                 last_message: false,
                                                 payload: Some(build_event_stream::build_event::Payload::Completed(build_event_stream::TargetComplete {
                                                     success: success,
-                                                    target_kind: "".to_owned(),
-                                                    test_size: 0,
                                                     output_group: vec![],
-                                                    important_output: vec![],
                                                     directory_output: vec![],
                                                     tag: vec![],
-                                                    test_timeout_seconds: 0,
                                                     test_timeout: None,
                                                     failure_detail: None,
+                                                    ..Default::default()
                                                 })),
                                             };
                                             let bazel_event = v1::build_event::Event::BazelEvent(prost_types::Any {
@@ -371,7 +368,6 @@ mod fbcode {
                                             children: vec![],
                                             last_message: true,
                                             payload: Some(build_event_stream::build_event::Payload::Finished(build_event_stream::BuildFinished {
-                                                overall_success: command.is_success,
                                                 exit_code: Some(
                                                     if command.is_success {
                                                         build_event_stream::build_finished::ExitCode {
@@ -384,11 +380,10 @@ mod fbcode {
                                                             code: 1,
                                                         }
                                                     }),
-                                                finish_time_millis: 0,
                                                 finish_time: Some(event.timestamp().into()),
-                                                anomaly_report: None,
                                                 // TODO: convert Buck2 ErrorReport
                                                 failure_detail: None,
+                                                ..Default::default()
                                             })),
                                         };
                                         let bazel_event = v1::build_event::Event::BazelEvent(prost_types::Any {
@@ -445,16 +440,16 @@ mod fbcode {
                                     Some(_) => vec![], // TODO: handle remote, worker, and other commands
                                 };
                                 let exit_code = last_command_details.and_then(|details| details.signed_exit_code).unwrap_or(0);
-                                let stdout = last_command_details.map(|details| details.stdout.clone());
-                                let stderr = last_command_details.map(|details| details.stderr.clone());
-                                let stdout_file = stdout.map(|stdout| bazel_event_publisher_proto::build_event_stream::File {
+                                let stdout = last_command_details.map(|details| details.cmd_stdout.clone());
+                                let stderr = last_command_details.map(|details| details.cmd_stderr.clone());
+                                let stdout_file = stdout.map(|stdout: String| bazel_event_publisher_proto::build_event_stream::File {
                                     path_prefix: vec![],
                                     name: "stdout".to_owned(),
                                     digest: "".to_owned(),
                                     length: stdout.len() as i64,
                                     file: Some(bazel_event_publisher_proto::build_event_stream::file::File::Contents(stdout.into())),
                                 });
-                                let stderr_file = stderr.clone().map(|stderr| bazel_event_publisher_proto::build_event_stream::File {
+                                let stderr_file = stderr.clone().map(|stderr: String| bazel_event_publisher_proto::build_event_stream::File {
                                     path_prefix: vec![],
                                     name: "stderr".to_owned(),
                                     digest: "".to_owned(),
@@ -489,8 +484,6 @@ mod fbcode {
                                         exit_code: exit_code,
                                         stdout: stdout_file,
                                         stderr: stderr_file,
-                                        label: "".to_owned(),
-                                        configuration: None,
                                         primary_output: None,
                                         command_line: command_line,
                                         action_metadata_logs: vec![],
@@ -498,6 +491,7 @@ mod fbcode {
                                         start_time: start_time, // TODO: should we deduct queue time?
                                         end_time: None,
                                         strategy_details: vec![],
+                                        ..Default::default()
                                     })),
                                 };
                                 let bazel_event = v1::build_event::Event::BazelEvent(prost_types::Any {
@@ -688,7 +682,7 @@ fn new_remote_event_sink_if_fbcode(
     {
         let _ = (fb, config);
         match std::env::var("BES_URI") {
-          Ok(_) => Ok(Some(RemoteEventSink::new()?)),
+          Ok(_) => Ok(Some(RemoteEventSink::new().map_err(|e| buck2_error::conversion::from_any_with_tag(e, buck2_error::ErrorTag::Environment))?)),
           _ => Ok(None),
         }
     }

@@ -2478,7 +2478,8 @@ impl EventSubscriber for InvocationRecorder {
             },
         )? {
             tracing::info!("Recording invocation to Scribe: {:?}", &event);
-            scribe_sink.send_now(event).await
+            scribe_sink.send_now(event).await;
+            Ok(())
         } else {
             tracing::info!("Invocation record is not sent to Scribe: {:?}", &event);
             Err(internal_error!("Scribe sink not enabled"))
