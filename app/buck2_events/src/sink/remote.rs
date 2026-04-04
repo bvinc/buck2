@@ -239,7 +239,9 @@ mod fbcode {
                                         // BEP: BuildStarted
                                         let bes_event = build_event_stream::BuildEvent {
                                             id: Some(build_event_stream::BuildEventId { id: Some(build_event_stream::build_event_id::Id::Started(build_event_stream::build_event_id::BuildStartedId {})) }),
-                                            children: vec![],
+                                            children: vec![
+                                                BuildEventId { id: Some(build_event_id::Id::BuildFinished(build_event_id::BuildFinishedId {})) },
+                                            ],
                                             last_message: false,
                                             payload: Some(build_event_stream::build_event::Payload::Started(build_event_stream::BuildStarted {
                                                 uuid: event.event.trace_id.clone(),
