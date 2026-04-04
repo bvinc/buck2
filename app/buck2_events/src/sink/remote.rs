@@ -656,24 +656,37 @@ mod fbcode {
                     };
 
                     // Process events from the converter, routing by transport tag.
+                    // Final lifecycle events (InvocationAttemptFinished, BuildFinished)
+                    // must be sent after the tool stream is fully closed and acknowledged,
+                    // otherwise the server rejects them as writes to a finished invocation.
+                    let mut final_lifecycle_events: Vec<v1::BuildEvent> = Vec::new();
+
                     while let Some(transport_event) = events.next().await {
                         match transport_event {
                             BesTransportEvent::Lifecycle(event) => {
-                                // Route to build stream or invocation stream based on event type.
-                                let (seq, stream_id) = match event.event.as_ref() {
-                                    Some(v1::build_event::Event::BuildEnqueued(_))
+                                // Buffer final lifecycle events to send after stream closes.
+                                match event.event.as_ref() {
+                                    Some(v1::build_event::Event::InvocationAttemptFinished(_))
                                     | Some(v1::build_event::Event::BuildFinished(_)) => {
-                                        build_seq += 1;
-                                        (build_seq, build_stream_id.clone())
+                                        final_lifecycle_events.push(event);
                                     }
                                     _ => {
-                                        invocation_seq += 1;
-                                        (invocation_seq, invocation_stream_id.clone())
+                                        // Send non-final lifecycle events immediately.
+                                        let (seq, stream_id) = match event.event.as_ref() {
+                                            Some(v1::build_event::Event::BuildEnqueued(_)) => {
+                                                build_seq += 1;
+                                                (build_seq, build_stream_id.clone())
+                                            }
+                                            _ => {
+                                                invocation_seq += 1;
+                                                (invocation_seq, invocation_stream_id.clone())
+                                            }
+                                        };
+                                        client.publish_lifecycle_event(Request::new(
+                                            make_lifecycle_req(seq, stream_id, event),
+                                        )).await.map_err(|e| anyhow::anyhow!("lifecycle RPC failed: {}", e))?;
                                     }
-                                };
-                                client.publish_lifecycle_event(Request::new(
-                                    make_lifecycle_req(seq, stream_id, event),
-                                )).await.map_err(|e| anyhow::anyhow!("lifecycle RPC failed: {}", e))?;
+                                }
                             }
                             BesTransportEvent::Stream(event) => {
                                 stream_seq += 1;
@@ -690,13 +703,30 @@ mod fbcode {
                             }
                         }
                     }
-                    // Close the stream sender to signal end of stream.
-                    drop(stream_tx);
 
-                    // Wait for the streaming RPC to finish draining ACKs.
+                    // Close the tool stream and wait for all ACKs before sending
+                    // final lifecycle events.
+                    drop(stream_tx);
                     stream_handle.await
                         .map_err(|e| anyhow::anyhow!("BES stream task panicked: {}", e))?
                         .map_err(|e| anyhow::anyhow!("BES stream RPC failed: {}", e))?;
+
+                    // Now send InvocationAttemptFinished and BuildFinished.
+                    for event in final_lifecycle_events {
+                        let (seq, stream_id) = match event.event.as_ref() {
+                            Some(v1::build_event::Event::BuildFinished(_)) => {
+                                build_seq += 1;
+                                (build_seq, build_stream_id.clone())
+                            }
+                            _ => {
+                                invocation_seq += 1;
+                                (invocation_seq, invocation_stream_id.clone())
+                            }
+                        };
+                        client.publish_lifecycle_event(Request::new(
+                            make_lifecycle_req(seq, stream_id, event),
+                        )).await.map_err(|e| anyhow::anyhow!("final lifecycle RPC failed: {}", e))?;
+                    }
 
                     tracing::info!(
                         "BES: published {} lifecycle events ({} build + {} invocation) and {} stream events",
