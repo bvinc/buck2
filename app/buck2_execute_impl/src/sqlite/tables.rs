@@ -9,4 +9,5 @@
  */
 
 pub(crate) mod incremental_state_table;
+pub mod local_action_cache_table;
 pub(crate) mod materializer_state_table;

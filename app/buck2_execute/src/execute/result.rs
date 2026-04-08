@@ -307,6 +307,15 @@ impl CommandExecutionResult {
         )
     }
 
+    pub fn was_local_action_cache_hit(&self) -> bool {
+        matches!(
+            self.report.status,
+            CommandExecutionStatus::Success {
+                execution_kind: CommandExecutionKind::LocalActionCache { .. },
+            }
+        )
+    }
+
     /// For content-based outputs, resolve the outputs to the "constant" (non-content-based) paths
     /// that are used during execution.
     pub fn resolve_outputs<'a>(

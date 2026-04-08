@@ -10,4 +10,4 @@
 
 pub mod incremental_state_db;
 pub mod materializer_db;
-pub(crate) mod tables;
+pub mod tables;

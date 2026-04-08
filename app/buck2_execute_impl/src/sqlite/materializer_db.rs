@@ -27,6 +27,7 @@ use chrono::Utc;
 use dupe::Dupe;
 
 use crate::materializers::deferred::artifact_tree::ArtifactMetadata;
+use crate::sqlite::tables::local_action_cache_table::LocalActionCacheSqliteTable;
 use crate::sqlite::tables::materializer_state_table::MaterializerStateSqliteTable;
 
 /// Hand-maintained schema version for the materializer state sqlite db.
@@ -34,7 +35,7 @@ use crate::sqlite::tables::materializer_state_table::MaterializerStateSqliteTabl
 /// materializer state sqlite db schema! If you forget to bump this version,
 /// then you can fix forward by bumping the `buck2.sqlite_materializer_state_version`
 /// buckconfig in the project root's .buckconfig.
-pub const MATERIALIZER_DB_SCHEMA_VERSION: u64 = 7;
+pub const MATERIALIZER_DB_SCHEMA_VERSION: u64 = 8;
 
 #[derive(Debug)]
 pub struct MaterializerStateEntry {
@@ -45,17 +46,26 @@ pub struct MaterializerStateEntry {
 
 pub type MaterializerState = Vec<MaterializerStateEntry>;
 
-/// Concrete implementation of SqliteTable for MaterializerStateSqliteTable
-impl SqliteTable for MaterializerStateSqliteTable {
+/// Composite table type holding both the materializer state and local action cache tables.
+/// Both tables live in the same SQLite database file and share a single connection.
+pub struct MaterializerDbTables {
+    pub materializer_state: MaterializerStateSqliteTable,
+    pub local_action_cache: LocalActionCacheSqliteTable,
+}
+
+impl SqliteTable for MaterializerDbTables {
     fn create_table(&self) -> buck2_error::Result<()> {
-        MaterializerStateSqliteTable::create_table(self)
+        MaterializerStateSqliteTable::create_table(&self.materializer_state)?;
+        LocalActionCacheSqliteTable::create_table(&self.local_action_cache)?;
+        Ok(())
     }
 }
 
 /// DB that opens the sqlite connection to the materializer state db on disk and
 /// holds all the sqlite tables we need for storing/querying materializer state
+/// and local action cache.
 pub struct MaterializerStateSqliteDb {
-    tables: SqliteTables<MaterializerStateSqliteTable>,
+    tables: SqliteTables<MaterializerDbTables>,
     /// A unique ID identifying this particular instance of the database. This will reset when we
     /// recreate it.
     identity: SqliteIdentity,
@@ -63,7 +73,7 @@ pub struct MaterializerStateSqliteDb {
 
 impl SqliteDb for MaterializerStateSqliteDb {
     type StateType = MaterializerState;
-    type TableType = MaterializerStateSqliteTable;
+    type TableType = MaterializerDbTables;
 
     fn new(tables: SqliteTables<Self::TableType>) -> buck2_error::Result<Self> {
         let identity = tables.get_identity()?;
@@ -73,7 +83,14 @@ impl SqliteDb for MaterializerStateSqliteDb {
     fn open_tables(path: &AbsNormPath) -> buck2_error::Result<SqliteTables<Self::TableType>> {
         let connection = SqliteTables::<Self::TableType>::create_connection(path)?;
         let materializer_state_table = MaterializerStateSqliteTable::new(connection.dupe());
-        Ok(SqliteTables::new(materializer_state_table, connection))
+        let local_action_cache_table = LocalActionCacheSqliteTable::new(connection.dupe());
+        Ok(SqliteTables::new(
+            MaterializerDbTables {
+                materializer_state: materializer_state_table,
+                local_action_cache: local_action_cache_table,
+            },
+            connection,
+        ))
     }
 
     fn identity(&self) -> &SqliteIdentity {
@@ -134,6 +151,7 @@ impl MaterializerStateSqliteDb {
                 match db
                     .tables
                     .domain_table
+                    .materializer_state
                     .read_materializer_state(digest_config)
                 {
                     Ok(state) => Ok((db, Ok(state))),
@@ -159,7 +177,22 @@ impl MaterializerStateSqliteDb {
     }
 
     pub(crate) fn materializer_state_table(&mut self) -> &MaterializerStateSqliteTable {
-        &self.tables.domain_table
+        &self.tables.domain_table.materializer_state
+    }
+
+    pub(crate) fn local_action_cache_table(&self) -> &LocalActionCacheSqliteTable {
+        &self.tables.domain_table.local_action_cache
+    }
+
+    /// Get the local action cache table wrapped in an Arc for sharing with the executor pipeline.
+    pub fn shared_local_action_cache_table(&self) -> Arc<LocalActionCacheSqliteTable> {
+        Arc::new(LocalActionCacheSqliteTable::new(
+            self.tables
+                .domain_table
+                .local_action_cache
+                .connection()
+                .dupe(),
+        ))
     }
 }
 
@@ -480,6 +513,42 @@ mod tests {
             db.materializer_state_table()
                 .insert(&path, &artifact_metadata, timestamp)
                 .unwrap();
+        }
+
+        // Verify local action cache table works through the DB initialization path
+        {
+            let (db, _loaded_state) = testing_materializer_state_sqlite_db(
+                fs.path(),
+                v1.clone(),
+                metadatas[2].clone(),
+                None,
+            )
+            .unwrap();
+
+            // Write to local action cache
+            db.local_action_cache_table()
+                .insert("digest_abc", "output1\noutput2")
+                .unwrap();
+
+            // Read back
+            assert_eq!(
+                db.local_action_cache_table().lookup("digest_abc").unwrap(),
+                Some("output1\noutput2".to_owned())
+            );
+
+            // Get shared table and verify it sees the same data
+            let shared = db.shared_local_action_cache_table();
+            assert_eq!(
+                shared.lookup("digest_abc").unwrap(),
+                Some("output1\noutput2".to_owned())
+            );
+
+            // Write through shared, read through original
+            shared.insert("digest_def", "output3").unwrap();
+            assert_eq!(
+                db.local_action_cache_table().lookup("digest_def").unwrap(),
+                Some("output3".to_owned())
+            );
         }
 
         let identity = {

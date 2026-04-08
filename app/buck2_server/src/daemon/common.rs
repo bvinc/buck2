@@ -36,6 +36,7 @@ use buck2_core::fs::project::ProjectRoot;
 use buck2_events::daemon_id::DaemonId;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::cache_uploader::NoOpCacheUploader;
+use buck2_execute::execute::cache_uploader::UploadCache;
 use buck2_execute::execute::cache_uploader::force_cache_upload;
 use buck2_execute::execute::prepared::NoOpCommandOptionalExecutor;
 use buck2_execute::execute::prepared::PreparedCommandExecutor;
@@ -55,8 +56,11 @@ use buck2_execute_impl::executors::hybrid::HybridExecutor;
 use buck2_execute_impl::executors::local::ForkserverAccess;
 use buck2_execute_impl::executors::local::LocalExecutor;
 use buck2_execute_impl::executors::re::ReExecutor;
+use buck2_execute_impl::executors::local_action_cache::LocalActionCacheChecker;
+use buck2_execute_impl::executors::local_action_cache::LocalActionCacheUploader;
 use buck2_execute_impl::executors::stacked::StackedExecutor;
 use buck2_execute_impl::executors::to_re_platform::RePlatformFieldsToRePlatform;
+use buck2_execute_impl::sqlite::tables::local_action_cache_table::LocalActionCacheSqliteTable;
 use buck2_execute_impl::executors::worker::WorkerPool;
 use buck2_execute_impl::low_pass_filter::LowPassFilter;
 use buck2_execute_impl::re::paranoid_download::ParanoidDownloader;
@@ -97,6 +101,7 @@ pub struct CommandExecutorFactory {
     deduplicate_get_digests_ttl_calls: bool,
     output_trees_download_config: OutputTreesDownloadConfig,
     daemon_id: DaemonId,
+    local_action_cache_table: Option<Arc<LocalActionCacheSqliteTable>>,
 }
 
 impl CommandExecutorFactory {
@@ -123,6 +128,7 @@ impl CommandExecutorFactory {
         deduplicate_get_digests_ttl_calls: bool,
         output_trees_download_config: OutputTreesDownloadConfig,
         daemon_id: DaemonId,
+        local_action_cache_table: Option<Arc<LocalActionCacheSqliteTable>>,
     ) -> Self {
         let cache_upload_permission_checker = Arc::new(ActionCacheUploadPermissionChecker::new());
 
@@ -151,6 +157,36 @@ impl CommandExecutorFactory {
             deduplicate_get_digests_ttl_calls,
             output_trees_download_config,
             daemon_id,
+            local_action_cache_table,
+        }
+    }
+
+    /// Create the local action cache checker and uploader if the table is available.
+    fn local_action_cache_executor(
+        &self,
+        artifact_fs: &ArtifactFs,
+    ) -> (
+        Arc<dyn PreparedCommandOptionalExecutor>,
+        Arc<dyn UploadCache>,
+    ) {
+        match &self.local_action_cache_table {
+            Some(table) => (
+                Arc::new(LocalActionCacheChecker {
+                    artifact_fs: artifact_fs.clone(),
+                    materializer: self.materializer.dupe(),
+                    blocking_executor: self.blocking_executor.dupe(),
+                    project_root: self.project_root.clone(),
+                    action_cache_table: table.dupe(),
+                }) as _,
+                Arc::new(LocalActionCacheUploader {
+                    artifact_fs: artifact_fs.clone(),
+                    action_cache_table: table.dupe(),
+                }) as _,
+            ),
+            None => (
+                Arc::new(NoOpCommandOptionalExecutor {}) as _,
+                Arc::new(NoOpCacheUploader {}) as _,
+            ),
         }
     }
 
@@ -215,12 +251,14 @@ impl HasCommandExecutor for CommandExecutorFactory {
                 return Err(ExecutorCompatibilityError::LocalIncompatible(self.strategy).into());
             }
 
+            let (action_cache_checker, cache_uploader) =
+                self.local_action_cache_executor(artifact_fs);
             return Ok(CommandExecutorResponse {
                 executor: Arc::new(local_executor_new(&LocalExecutorOptions::default())),
                 platform: Default::default(),
-                action_cache_checker: Arc::new(NoOpCommandOptionalExecutor {}),
+                action_cache_checker,
                 remote_dep_file_cache_checker: Arc::new(NoOpCommandOptionalExecutor {}),
-                cache_uploader: Arc::new(NoOpCacheUploader {}),
+                cache_uploader,
                 output_trees_download_config: self.output_trees_download_config.dupe(),
             });
         }
@@ -261,12 +299,14 @@ impl HasCommandExecutor for CommandExecutorFactory {
                 if self.strategy.ban_local() {
                     None
                 } else {
+                    let (action_cache_checker, cache_uploader) =
+                        self.local_action_cache_executor(artifact_fs);
                     Some(CommandExecutorResponse {
                         executor: Arc::new(local_executor_new(local)),
                         platform: Default::default(),
-                        action_cache_checker: Arc::new(NoOpCommandOptionalExecutor {}),
+                        action_cache_checker,
                         remote_dep_file_cache_checker: Arc::new(NoOpCommandOptionalExecutor {}),
-                        cache_uploader: Arc::new(NoOpCacheUploader {}),
+                        cache_uploader,
                         output_trees_download_config: self.output_trees_download_config.dupe(),
                     })
                 }

@@ -65,6 +65,7 @@ use buck2_execute_impl::re::paranoid_download::ParanoidDownloader;
 use buck2_execute_impl::sqlite::incremental_state_db::IncrementalDbState;
 use buck2_execute_impl::sqlite::materializer_db::MaterializerState;
 use buck2_execute_impl::sqlite::materializer_db::MaterializerStateSqliteDb;
+use buck2_execute_impl::sqlite::tables::local_action_cache_table::LocalActionCacheSqliteTable;
 use buck2_file_watcher::file_watcher::FileWatcher;
 use buck2_fs::cwd::WorkingDirectory;
 use buck2_hash::StdBuckHashMap;
@@ -208,6 +209,10 @@ pub struct DaemonStateData {
     /// Semaphores for running actions locally. These need to be shared across commands.
     #[allocative(skip)]
     pub named_semaphores_for_run_actions: Arc<NamedSemaphores>,
+
+    /// Local action cache table for persisting action results across daemon restarts.
+    #[allocative(skip)]
+    pub local_action_cache_table: Option<Arc<LocalActionCacheSqliteTable>>,
 }
 
 impl DaemonStateData {
@@ -565,6 +570,11 @@ impl DaemonState {
                 // but for now seems fine to drop events if scribe isn't enabled.
                 EventDispatcher::null()
             };
+            // Extract the local action cache table before the materializer DB is consumed.
+            let local_action_cache_table = materializer_db
+                .as_ref()
+                .map(|db| db.shared_local_action_cache_table());
+
             let materializer = Self::create_materializer(
                 io.project_root().dupe(),
                 digest_config,
@@ -729,6 +739,7 @@ impl DaemonState {
                 incremental_db_state,
                 daemon_id: daemon_id.dupe(),
                 named_semaphores_for_run_actions: Arc::new(NamedSemaphores::new()),
+                local_action_cache_table,
             }))
         };
         let daemon_listener_span = tracing::Span::current();

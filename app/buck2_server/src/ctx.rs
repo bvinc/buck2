@@ -865,6 +865,11 @@ impl DiceCommandUpdater<'_, '_> {
             run_action_knobs.deduplicate_get_digests_ttl_calls,
             output_trees_download_config.dupe(),
             self.cmd_ctx.base_context.daemon.daemon_id.dupe(),
+            self.cmd_ctx
+                .base_context
+                .daemon
+                .local_action_cache_table
+                .dupe(),
         )));
         data.set_blocking_executor(self.cmd_ctx.base_context.daemon.blocking_executor.dupe());
         data.set_http_client(self.cmd_ctx.base_context.daemon.http_client.dupe());

@@ -59,6 +59,11 @@ pub enum CommandExecutionKind {
     RemoteDepFileCache {
         details: RemoteCommandExecutionDetails,
     },
+    /// This action was served by the local action cache and not executed.
+    #[display("local_action_cache")]
+    LocalActionCache {
+        digest: ActionDigest,
+    },
     /// This action would have executed via a local worker but failed during worker initialization.
     #[display("worker_init")]
     LocalWorkerInit {
@@ -88,6 +93,7 @@ impl CommandExecutionKind {
             },
             Self::ActionCache { .. } => buck2_data::ActionExecutionKind::ActionCache,
             Self::RemoteDepFileCache { .. } => buck2_data::ActionExecutionKind::RemoteDepFileCache,
+            Self::LocalActionCache { .. } => buck2_data::ActionExecutionKind::LocalActionCache,
         }
     }
 
@@ -97,7 +103,10 @@ impl CommandExecutionKind {
             Self::Remote { details, .. }
             | Self::ActionCache { details }
             | Self::RemoteDepFileCache { details } => details,
-            _ => return None,
+            Self::Local { .. }
+            | Self::LocalWorkerInit { .. }
+            | Self::LocalWorker { .. }
+            | Self::LocalActionCache { .. } => return None,
         };
         details
             .platform
@@ -212,6 +221,20 @@ impl CommandExecutionKind {
                     .collect(),
                 fallback_exe: fallback_exe.to_owned(),
             }),
+
+            Self::LocalActionCache { digest } => {
+                if omit_details {
+                    Command::OmittedLocalCommand(buck2_data::OmittedLocalCommand {
+                        action_digest: digest.to_string(),
+                    })
+                } else {
+                    Command::LocalCommand(buck2_data::LocalCommand {
+                        action_digest: digest.to_string(),
+                        argv: vec![],
+                        env: vec![],
+                    })
+                }
+            }
         });
 
         buck2_data::CommandExecutionKind { command }
