@@ -213,6 +213,10 @@ mod fbcode {
         let mut configured_targets: Vec<(String, String, String)> = Vec::new();
         // Track parsed target patterns from ParsedTargetPatterns instant event
         let mut parsed_patterns: Vec<String> = Vec::new();
+        // Progress event chain counter. BuildStarted declares Progress(0) as child.
+        // Each Progress(N) declares Progress(N+1) as child, forming a chain.
+        // The final Progress at CommandEnd adopts PatternExpanded events.
+        let mut progress_count: i32 = 0;
         stream! {
             for await event in events {
                 match event.data() {
@@ -362,8 +366,9 @@ mod fbcode {
                                                 }))}
                                             }).collect()
                                         };
+                                        // Final Progress(N) in the chain — adopts all PatternExpanded events.
                                         let bes_event = build_event_stream::BuildEvent {
-                                            id: Some(BuildEventId { id: Some(build_event_id::Id::Progress(build_event_id::ProgressId { opaque_count: 0 })) }),
+                                            id: Some(BuildEventId { id: Some(build_event_id::Id::Progress(build_event_id::ProgressId { opaque_count: progress_count })) }),
                                             children: pattern_children,
                                             last_message: false,
                                             payload: Some(build_event_stream::build_event::Payload::Progress(build_event_stream::Progress {
@@ -655,6 +660,29 @@ mod fbcode {
                         match instant.data.as_ref() {
                             Some(buck2_data::instant_event::Data::TargetPatterns(patterns)) => {
                                 parsed_patterns = patterns.target_patterns.iter().map(|p| p.value.clone()).collect();
+                            }
+                            Some(buck2_data::instant_event::Data::ConsoleMessage(msg)) => {
+                                // BEP: Progress(N) — chains to Progress(N+1)
+                                let bes_event = build_event_stream::BuildEvent {
+                                    id: Some(BuildEventId { id: Some(build_event_id::Id::Progress(build_event_id::ProgressId { opaque_count: progress_count })) }),
+                                    children: vec![
+                                        BuildEventId { id: Some(build_event_id::Id::Progress(build_event_id::ProgressId { opaque_count: progress_count + 1 })) },
+                                    ],
+                                    last_message: false,
+                                    payload: Some(build_event_stream::build_event::Payload::Progress(build_event_stream::Progress {
+                                        stdout: String::new(),
+                                        stderr: msg.message.clone(),
+                                    })),
+                                };
+                                let bazel_event = v1::build_event::Event::BazelEvent(prost_types::Any {
+                                    type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
+                                    value: bes_event.encode_to_vec(),
+                                });
+                                yield BesTransportEvent::Stream(v1::BuildEvent {
+                                    event_time: Some(event.timestamp().into()),
+                                    event: Some(bazel_event),
+                                });
+                                progress_count += 1;
                             }
                             _ => {}
                         }
@@ -1451,6 +1479,63 @@ mod fbcode {
             ]);
             let events: Vec<_> = buck_to_bazel_events(stream).collect().await;
             assert_valid_bep_dag(&events);
+        }
+
+        fn console_message(msg: &str) -> buck2_data::buck_event::Data {
+            buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+                data: Some(buck2_data::instant_event::Data::ConsoleMessage(
+                    buck2_data::ConsoleMessage {
+                        message: msg.to_owned(),
+                    },
+                )),
+            })
+        }
+
+        #[tokio::test]
+        async fn test_dag_build_with_progress() {
+            let t = TraceId::new();
+            let stream = tokio_stream::iter(vec![
+                buck_event(&t, build_start()),
+                buck_event(&t, parsed_target_patterns(&["//foo:bar"])),
+                buck_event(&t, console_message("Analyzing target //foo:bar")),
+                buck_event(&t, analysis_start("foo:bar", "cfg//linux-x86_64", "rust_binary")),
+                buck_event(&t, console_message("Building //foo:bar")),
+                buck_event(&t, action_execution_end("foo:bar", "cfg//linux-x86_64", false)),
+                buck_event(&t, build_end(true)),
+            ]);
+            let events: Vec<_> = buck_to_bazel_events(stream).collect().await;
+            assert_valid_bep_dag(&events);
+
+            // Verify the Progress chain has the right content
+            let progress_events: Vec<_> = events.iter().filter_map(|e| {
+                let v1_event = match e {
+                    BesTransportEvent::Stream(e) => e,
+                    _ => return None,
+                };
+                let any = match v1_event.event.as_ref()? {
+                    v1::build_event::Event::BazelEvent(any) => any,
+                    _ => return None,
+                };
+                let bes = build_event_stream::BuildEvent::decode(any.value.as_slice()).ok()?;
+                match bes.id.as_ref()?.id.as_ref()? {
+                    build_event_id::Id::Progress(p) => {
+                        let stderr = match bes.payload.as_ref()? {
+                            build_event_stream::build_event::Payload::Progress(p) => p.stderr.clone(),
+                            _ => String::new(),
+                        };
+                        Some((p.opaque_count, stderr))
+                    }
+                    _ => None,
+                }
+            }).collect();
+
+            // Progress(0) and Progress(1) carry console messages,
+            // Progress(2) is the final one at CommandEnd (empty stderr, adopts patterns).
+            assert_eq!(progress_events.len(), 3);
+            assert_eq!(progress_events[0], (0, "Analyzing target //foo:bar".to_owned()));
+            assert_eq!(progress_events[1], (1, "Building //foo:bar".to_owned()));
+            assert_eq!(progress_events[2].0, 2);
+            assert!(progress_events[2].1.is_empty());
         }
     }
 }
