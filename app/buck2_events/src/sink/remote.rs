@@ -207,6 +207,24 @@ mod fbcode {
         Stream(v1::BuildEvent),
     }
 
+    /// Convert a Buck2 label to a valid Bazel label string.
+    ///
+    /// HACK: Buck2 labels use `cell//pkg:target` (e.g. `root//foo:bar`) which is
+    /// not a valid Bazel label. BES servers like EngFlow parse these as Bazel
+    /// labels and reject the `cell//` prefix. As a workaround we prepend `@` to
+    /// produce `@cell//pkg:target`, which is syntactically valid Bazel (external
+    /// repo label) but semantically incorrect — Buck2 cells are not Bazel repos.
+    ///
+    /// This needs a proper solution in the future, e.g. a BES-server-side label
+    /// format that understands Buck2 cells, or a configurable label mapping.
+    fn bazel_label(package: &str, name: &str) -> String {
+        if package.starts_with("//") || package.starts_with('@') {
+            format!("{}:{}", package, name)
+        } else {
+            format!("@{}:{}", package, name)
+        }
+    }
+
     fn buck_to_bazel_events<S: Stream<Item = BuckEvent>>(events: S) -> impl Stream<Item = BesTransportEvent> {
         let mut target_actions: HashMap<(String, String), Vec<(BuildEventId, bool)>> = HashMap::new();
         // Track configured targets for the BEP event graph: (label, config_full_name, rule_type)
@@ -301,7 +319,7 @@ mod fbcode {
                                 // Extract label and configuration from ConfiguredTargetLabel
                                 let (label, config, rule) = match analysis.target.as_ref() {
                                     Some(buck2_data::analysis_start::Target::StandardTarget(ct)) => {
-                                        let label = ct.label.as_ref().map(|l| format!("{}:{}", l.package, l.name));
+                                        let label = ct.label.as_ref().map(|l| bazel_label(&l.package, &l.name));
                                         let config = ct.configuration.as_ref().map(|c| c.full_name.clone());
                                         (label, config, analysis.rule.clone())
                                     }
@@ -575,7 +593,7 @@ mod fbcode {
                                            buck2_data::action_key::Owner::BxlKey(_bxl) => None, // TODO: handle bxl
                                         },
                                     },
-                                }.map(|label| format!("{}:{}", label.package, label.name));
+                                }.map(|label| bazel_label(&label.package, &label.name));
                                 let action_id = BuildEventId {id: Some(build_event_id::Id::ActionCompleted(build_event_id::ActionCompletedId {
                                     configuration: configuration.clone(),
                                     label: label.clone().unwrap_or("UNKNOWN".to_owned()),
@@ -1435,16 +1453,26 @@ mod fbcode {
             assert_valid_bep_dag(&events);
         }
 
+        #[test]
+        fn test_bazel_label_conversion() {
+            // Buck2 cell-prefixed labels get @ prepended
+            assert_eq!(bazel_label("root//foo", "bar"), "@root//foo:bar");
+            assert_eq!(bazel_label("cell//pkg/sub", "target"), "@cell//pkg/sub:target");
+            // Already Bazel-style labels are left as-is
+            assert_eq!(bazel_label("//foo", "bar"), "//foo:bar");
+            assert_eq!(bazel_label("@repo//foo", "bar"), "@repo//foo:bar");
+        }
+
         #[tokio::test]
         async fn test_dag_build_with_targets() {
             let t = TraceId::new();
             let stream = tokio_stream::iter(vec![
                 buck_event(&t, build_start()),
-                buck_event(&t, parsed_target_patterns(&["//foo/..."])),
-                buck_event(&t, analysis_start("foo:bar", "cfg//linux-x86_64", "rust_binary")),
-                buck_event(&t, analysis_start("foo:baz", "cfg//linux-x86_64", "rust_library")),
-                buck_event(&t, action_execution_end("foo:bar", "cfg//linux-x86_64", false)),
-                buck_event(&t, action_execution_end("foo:baz", "cfg//linux-x86_64", false)),
+                buck_event(&t, parsed_target_patterns(&["root//foo/..."])),
+                buck_event(&t, analysis_start("root//foo:bar", "cfg//linux-x86_64", "rust_binary")),
+                buck_event(&t, analysis_start("root//foo:baz", "cfg//linux-x86_64", "rust_library")),
+                buck_event(&t, action_execution_end("root//foo:bar", "cfg//linux-x86_64", false)),
+                buck_event(&t, action_execution_end("root//foo:baz", "cfg//linux-x86_64", false)),
                 buck_event(&t, build_end(true)),
             ]);
             let events: Vec<_> = buck_to_bazel_events(stream).collect().await;
@@ -1457,8 +1485,8 @@ mod fbcode {
             let t = TraceId::new();
             let stream = tokio_stream::iter(vec![
                 buck_event(&t, build_start()),
-                buck_event(&t, analysis_start("foo:bar", "cfg//linux-x86_64", "rust_binary")),
-                buck_event(&t, action_execution_end("foo:bar", "cfg//linux-x86_64", false)),
+                buck_event(&t, analysis_start("root//foo:bar", "cfg//linux-x86_64", "rust_binary")),
+                buck_event(&t, action_execution_end("root//foo:bar", "cfg//linux-x86_64", false)),
                 buck_event(&t, build_end(true)),
             ]);
             let events: Vec<_> = buck_to_bazel_events(stream).collect().await;
@@ -1470,11 +1498,11 @@ mod fbcode {
             let t = TraceId::new();
             let stream = tokio_stream::iter(vec![
                 buck_event(&t, build_start()),
-                buck_event(&t, parsed_target_patterns(&["//foo:bar", "//foo:baz"])),
-                buck_event(&t, analysis_start("foo:bar", "cfg//linux-x86_64", "rust_binary")),
-                buck_event(&t, analysis_start("foo:baz", "cfg//linux-x86_64", "rust_library")),
-                buck_event(&t, action_execution_end("foo:bar", "cfg//linux-x86_64", false)),
-                buck_event(&t, action_execution_end("foo:baz", "cfg//linux-x86_64", false)),
+                buck_event(&t, parsed_target_patterns(&["root//foo:bar", "root//foo:baz"])),
+                buck_event(&t, analysis_start("root//foo:bar", "cfg//linux-x86_64", "rust_binary")),
+                buck_event(&t, analysis_start("root//foo:baz", "cfg//linux-x86_64", "rust_library")),
+                buck_event(&t, action_execution_end("root//foo:bar", "cfg//linux-x86_64", false)),
+                buck_event(&t, action_execution_end("root//foo:baz", "cfg//linux-x86_64", false)),
                 buck_event(&t, build_end(true)),
             ]);
             let events: Vec<_> = buck_to_bazel_events(stream).collect().await;
@@ -1496,11 +1524,11 @@ mod fbcode {
             let t = TraceId::new();
             let stream = tokio_stream::iter(vec![
                 buck_event(&t, build_start()),
-                buck_event(&t, parsed_target_patterns(&["//foo:bar"])),
-                buck_event(&t, console_message("Analyzing target //foo:bar")),
-                buck_event(&t, analysis_start("foo:bar", "cfg//linux-x86_64", "rust_binary")),
-                buck_event(&t, console_message("Building //foo:bar")),
-                buck_event(&t, action_execution_end("foo:bar", "cfg//linux-x86_64", false)),
+                buck_event(&t, parsed_target_patterns(&["root//foo:bar"])),
+                buck_event(&t, console_message("Analyzing target root//foo:bar")),
+                buck_event(&t, analysis_start("root//foo:bar", "cfg//linux-x86_64", "rust_binary")),
+                buck_event(&t, console_message("Building root//foo:bar")),
+                buck_event(&t, action_execution_end("root//foo:bar", "cfg//linux-x86_64", false)),
                 buck_event(&t, build_end(true)),
             ]);
             let events: Vec<_> = buck_to_bazel_events(stream).collect().await;
@@ -1532,8 +1560,8 @@ mod fbcode {
             // Progress(0) and Progress(1) carry console messages,
             // Progress(2) is the final one at CommandEnd (empty stderr, adopts patterns).
             assert_eq!(progress_events.len(), 3);
-            assert_eq!(progress_events[0], (0, "Analyzing target //foo:bar".to_owned()));
-            assert_eq!(progress_events[1], (1, "Building //foo:bar".to_owned()));
+            assert_eq!(progress_events[0], (0, "Analyzing target root//foo:bar".to_owned()));
+            assert_eq!(progress_events[1], (1, "Building root//foo:bar".to_owned()));
             assert_eq!(progress_events[2].0, 2);
             assert!(progress_events[2].1.is_empty());
         }
