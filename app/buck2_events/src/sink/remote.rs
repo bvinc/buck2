@@ -209,6 +209,10 @@ mod fbcode {
 
     fn buck_to_bazel_events<S: Stream<Item = BuckEvent>>(events: S) -> impl Stream<Item = BesTransportEvent> {
         let mut target_actions: HashMap<(String, String), Vec<(BuildEventId, bool)>> = HashMap::new();
+        // Track configured targets for the BEP event graph: (label, config_full_name, rule_type)
+        let mut configured_targets: Vec<(String, String, String)> = Vec::new();
+        // Track parsed target patterns from ParsedTargetPatterns instant event
+        let mut parsed_patterns: Vec<String> = Vec::new();
         stream! {
             for await event in events {
                 match event.data() {
@@ -237,10 +241,15 @@ mod fbcode {
                                             )),
                                         });
                                         // BEP: BuildStarted
+                                        // Children: BuildFinished, UnstructuredCommandLine, Progress(0)
+                                        // Progress(0) serves as catch-all parent for PatternExpanded events
+                                        // that arrive later once we know the target patterns.
                                         let bes_event = build_event_stream::BuildEvent {
                                             id: Some(build_event_stream::BuildEventId { id: Some(build_event_stream::build_event_id::Id::Started(build_event_stream::build_event_id::BuildStartedId {})) }),
                                             children: vec![
                                                 BuildEventId { id: Some(build_event_id::Id::BuildFinished(build_event_id::BuildFinishedId {})) },
+                                                BuildEventId { id: Some(build_event_id::Id::UnstructuredCommandLine(build_event_id::UnstructuredCommandLineId {})) },
+                                                BuildEventId { id: Some(build_event_id::Id::Progress(build_event_id::ProgressId { opaque_count: 0 })) },
                                             ],
                                             last_message: false,
                                             payload: Some(build_event_stream::build_event::Payload::Started(build_event_stream::BuildStarted {
@@ -263,32 +272,103 @@ mod fbcode {
                                             event_time: Some(event.timestamp().into()),
                                             event: Some(bazel_event),
                                         });
+                                        // BEP: UnstructuredCommandLine
+                                        let bes_event = build_event_stream::BuildEvent {
+                                            id: Some(BuildEventId { id: Some(build_event_id::Id::UnstructuredCommandLine(build_event_id::UnstructuredCommandLineId {})) }),
+                                            children: vec![],
+                                            last_message: false,
+                                            payload: Some(build_event_stream::build_event::Payload::UnstructuredCommandLine(build_event_stream::UnstructuredCommandLine {
+                                                args: command.cli_args.clone(),
+                                            })),
+                                        };
+                                        let bazel_event = v1::build_event::Event::BazelEvent(prost_types::Any {
+                                            type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
+                                            value: bes_event.encode_to_vec(),
+                                        });
+                                        yield BesTransportEvent::Stream(v1::BuildEvent {
+                                            event_time: Some(event.timestamp().into()),
+                                            event: Some(bazel_event),
+                                        });
                                     },
                                     Some(_) => {},
                                 }
                             },
                             Some(buck2_data::span_start_event::Data::Analysis(analysis)) => {
-                                let label = match analysis.target.as_ref() {
-                                    None => None,
-                                    Some(buck2_data::analysis_start::Target::StandardTarget(label)) =>
-                                        label.label.as_ref().map(|label| format!("{}:{}", label.package, label.name)),
-                                    Some(buck2_data::analysis_start::Target::AnonTarget(_anon)) => None, // TODO
-                                    Some(buck2_data::analysis_start::Target::DynamicLambda(_owner)) => None, // TODO
+                                // Extract label and configuration from ConfiguredTargetLabel
+                                let (label, config, rule) = match analysis.target.as_ref() {
+                                    Some(buck2_data::analysis_start::Target::StandardTarget(ct)) => {
+                                        let label = ct.label.as_ref().map(|l| format!("{}:{}", l.package, l.name));
+                                        let config = ct.configuration.as_ref().map(|c| c.full_name.clone());
+                                        (label, config, analysis.rule.clone())
+                                    }
+                                    _ => (None, None, String::new()),
                                 };
-                                match label {
-                                    None => {},
-                                    Some(label) => {
-                                        let bes_event = build_event_stream::BuildEvent {
-                                            id: Some(build_event_stream::BuildEventId { id: Some(build_event_stream::build_event_id::Id::TargetConfigured(build_event_id::TargetConfiguredId {
+                                if let (Some(label), Some(config)) = (label, config) {
+                                    configured_targets.push((label.clone(), config.clone(), rule.clone()));
+                                    // BEP: TargetConfigured — declares TargetCompleted as child
+                                    let bes_event = build_event_stream::BuildEvent {
+                                        id: Some(BuildEventId { id: Some(build_event_id::Id::TargetConfigured(build_event_id::TargetConfiguredId {
+                                            label: label.clone(),
+                                            aspect: "".to_owned(),
+                                        })) }),
+                                        children: vec![
+                                            BuildEventId { id: Some(build_event_id::Id::TargetCompleted(build_event_id::TargetCompletedId {
                                                 label: label.clone(),
+                                                configuration: Some(build_event_id::ConfigurationId { id: config }),
                                                 aspect: "".to_owned(),
-                                            })) }),
-                                            children: vec![],
+                                            }))},
+                                        ],
+                                        last_message: false,
+                                        payload: Some(build_event_stream::build_event::Payload::Configured(build_event_stream::TargetConfigured {
+                                            target_kind: if rule.is_empty() { "unknown rule type".to_owned() } else { rule },
+                                            test_size: 0,
+                                            tag: vec![],
+                                        })),
+                                    };
+                                    let bazel_event = v1::build_event::Event::BazelEvent(prost_types::Any {
+                                        type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
+                                        value: bes_event.encode_to_vec(),
+                                    });
+                                    yield BesTransportEvent::Stream(v1::BuildEvent {
+                                        event_time: Some(event.timestamp().into()),
+                                        event: Some(bazel_event),
+                                    });
+                                    // PatternExpanded is emitted at CommandEnd via Progress(0)
+                                }
+                            },
+                            Some(_) => {},
+                        }
+                    },
+                    buck2_data::buck_event::Data::SpanEnd(end) => {
+                        match end.data.as_ref() {
+                            None => {},
+                            Some(buck2_data::span_end_event::Data::Command(command)) => {
+                                match command.data.as_ref() {
+                                    None => {},
+                                    Some(buck2_data::command_end::Data::Build(_build)) => {
+                                        // BEP: Progress(0) — catch-all parent for PatternExpanded events.
+                                        // Emitted here so it can declare all patterns as children.
+                                        let pattern_children: Vec<BuildEventId> = if !parsed_patterns.is_empty() {
+                                            parsed_patterns.iter().map(|p| {
+                                                BuildEventId { id: Some(build_event_id::Id::Pattern(build_event_id::PatternExpandedId {
+                                                    pattern: vec![p.clone()],
+                                                }))}
+                                            }).collect()
+                                        } else {
+                                            // Fallback: one PatternExpanded per configured target label
+                                            configured_targets.iter().map(|(label, _, _)| {
+                                                BuildEventId { id: Some(build_event_id::Id::Pattern(build_event_id::PatternExpandedId {
+                                                    pattern: vec![label.clone()],
+                                                }))}
+                                            }).collect()
+                                        };
+                                        let bes_event = build_event_stream::BuildEvent {
+                                            id: Some(BuildEventId { id: Some(build_event_id::Id::Progress(build_event_id::ProgressId { opaque_count: 0 })) }),
+                                            children: pattern_children,
                                             last_message: false,
-                                            payload: Some(build_event_stream::build_event::Payload::Configured(bazel_event_publisher_proto::build_event_stream::TargetConfigured {
-                                                target_kind: "UNKNOWN".to_owned(),
-                                                test_size: 0,
-                                                tag: vec![],
+                                            payload: Some(build_event_stream::build_event::Payload::Progress(build_event_stream::Progress {
+                                                stdout: String::new(),
+                                                stderr: String::new(),
                                             })),
                                         };
                                         let bazel_event = v1::build_event::Event::BazelEvent(prost_types::Any {
@@ -300,44 +380,65 @@ mod fbcode {
                                             event: Some(bazel_event),
                                         });
 
-                                        let bes_event = build_event_stream::BuildEvent {
-                                            id: Some(build_event_stream::BuildEventId { id: Some(build_event_stream::build_event_id::Id::Pattern(build_event_id::PatternExpandedId {
-                                                pattern: vec![label.clone()],
-                                            })) }),
-                                            children: vec![
-                                                build_event_stream::BuildEventId { id: Some(build_event_stream::build_event_id::Id::TargetConfigured(bazel_event_publisher_proto::build_event_stream::build_event_id::TargetConfiguredId {
-                                                    label: label,
-                                                    aspect: "".to_owned(),
-                                                }))},
-                                            ],
-                                            last_message: false,
-                                            payload: Some(build_event_stream::build_event::Payload::Expanded(bazel_event_publisher_proto::build_event_stream::PatternExpanded {
-                                                test_suite_expansions: vec![],
-                                            })),
-                                        };
-                                        let bazel_event = v1::build_event::Event::BazelEvent(prost_types::Any {
-                                            type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
-                                            value: bes_event.encode_to_vec(),
-                                        });
-                                        yield BesTransportEvent::Stream(v1::BuildEvent {
-                                            event_time: Some(event.timestamp().into()),
-                                            event: Some(bazel_event),
-                                        });
-                                    },
-                                }
-                            },
-                            Some(_) => {},
-                        }
-                    },
-                    buck2_data::buck_event::Data::SpanEnd(end) => {
-                        //println!("END   {:?}", end);
-                        match end.data.as_ref() {
-                            None => {},
-                            Some(buck2_data::span_end_event::Data::Command(command)) => {
-                                match command.data.as_ref() {
-                                    None => {},
-                                    Some(buck2_data::command_end::Data::Build(_build)) => {
-                                        // flush the target completed map.
+                                        // BEP: PatternExpanded events
+                                        let all_target_configured_ids: Vec<BuildEventId> = configured_targets.iter().map(|(label, _, _)| {
+                                            BuildEventId { id: Some(build_event_id::Id::TargetConfigured(build_event_id::TargetConfiguredId {
+                                                label: label.clone(),
+                                                aspect: "".to_owned(),
+                                            }))}
+                                        }).collect();
+
+                                        if !parsed_patterns.is_empty() {
+                                            for pattern in parsed_patterns.iter() {
+                                                let bes_event = build_event_stream::BuildEvent {
+                                                    id: Some(BuildEventId { id: Some(build_event_id::Id::Pattern(build_event_id::PatternExpandedId {
+                                                        pattern: vec![pattern.clone()],
+                                                    })) }),
+                                                    children: all_target_configured_ids.clone(),
+                                                    last_message: false,
+                                                    payload: Some(build_event_stream::build_event::Payload::Expanded(build_event_stream::PatternExpanded {
+                                                        test_suite_expansions: vec![],
+                                                    })),
+                                                };
+                                                let bazel_event = v1::build_event::Event::BazelEvent(prost_types::Any {
+                                                    type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
+                                                    value: bes_event.encode_to_vec(),
+                                                });
+                                                yield BesTransportEvent::Stream(v1::BuildEvent {
+                                                    event_time: Some(event.timestamp().into()),
+                                                    event: Some(bazel_event),
+                                                });
+                                            }
+                                        } else {
+                                            // Fallback: one PatternExpanded per target
+                                            for (label, _, _) in configured_targets.iter() {
+                                                let bes_event = build_event_stream::BuildEvent {
+                                                    id: Some(BuildEventId { id: Some(build_event_id::Id::Pattern(build_event_id::PatternExpandedId {
+                                                        pattern: vec![label.clone()],
+                                                    })) }),
+                                                    children: vec![
+                                                        BuildEventId { id: Some(build_event_id::Id::TargetConfigured(build_event_id::TargetConfiguredId {
+                                                            label: label.clone(),
+                                                            aspect: "".to_owned(),
+                                                        }))},
+                                                    ],
+                                                    last_message: false,
+                                                    payload: Some(build_event_stream::build_event::Payload::Expanded(build_event_stream::PatternExpanded {
+                                                        test_suite_expansions: vec![],
+                                                    })),
+                                                };
+                                                let bazel_event = v1::build_event::Event::BazelEvent(prost_types::Any {
+                                                    type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
+                                                    value: bes_event.encode_to_vec(),
+                                                });
+                                                yield BesTransportEvent::Stream(v1::BuildEvent {
+                                                    event_time: Some(event.timestamp().into()),
+                                                    event: Some(bazel_event),
+                                                });
+                                            }
+                                        }
+
+                                        // Flush the target completed map.
                                         for ((label, config), actions) in target_actions.into_iter() {
                                             let success = actions.iter().all(|(_, success)| *success);
                                             let children: Vec<_> = actions.into_iter().map(|(id, _)| id).collect();
@@ -550,8 +651,13 @@ mod fbcode {
                             Some(_) => {},
                         }
                     },
-                    buck2_data::buck_event::Data::Instant(_instant) => {
-                        //println!("INST  {:?}", instant);
+                    buck2_data::buck_event::Data::Instant(instant) => {
+                        match instant.data.as_ref() {
+                            Some(buck2_data::instant_event::Data::TargetPatterns(patterns)) => {
+                                parsed_patterns = patterns.target_patterns.iter().map(|p| p.value.clone()).collect();
+                            }
+                            _ => {}
+                        }
                     },
                     buck2_data::buck_event::Data::Record(_record) => {
                         //println!("REC   {:?}", record);
@@ -902,6 +1008,8 @@ mod fbcode {
             LifecycleBuildFinished,
             // BEP stream events (sent via PublishBuildToolEventStream)
             Started,
+            UnstructuredCommandLine,
+            Progress,
             Finished { success: bool },
             TargetConfigured { label: String },
             PatternExpanded,
@@ -986,6 +1094,18 @@ mod fbcode {
                             assert!(
                                 matches!(id, Some(build_event_stream::build_event_id::Id::Started(_))),
                                 "expected Started, got {:?}", id,
+                            );
+                        }
+                        Expected::UnstructuredCommandLine => {
+                            assert!(
+                                matches!(id, Some(build_event_stream::build_event_id::Id::UnstructuredCommandLine(_))),
+                                "expected UnstructuredCommandLine, got {:?}", id,
+                            );
+                        }
+                        Expected::Progress => {
+                            assert!(
+                                matches!(id, Some(build_event_stream::build_event_id::Id::Progress(_))),
+                                "expected Progress, got {:?}", id,
                             );
                         }
                         Expected::Finished { success } => {
@@ -1079,6 +1199,8 @@ mod fbcode {
                     Expected::BuildEnqueued,
                     Expected::InvocationAttemptStarted,
                     Expected::Started,
+                    Expected::UnstructuredCommandLine,
+                    Expected::Progress,
                     Expected::Finished { success: true },
                     Expected::ComponentStreamFinished,
                     Expected::InvocationAttemptFinished,
@@ -1099,6 +1221,8 @@ mod fbcode {
                     Expected::BuildEnqueued,
                     Expected::InvocationAttemptStarted,
                     Expected::Started,
+                    Expected::UnstructuredCommandLine,
+                    Expected::Progress,
                     Expected::Finished { success: false },
                     Expected::ComponentStreamFinished,
                     Expected::InvocationAttemptFinished,
@@ -1128,6 +1252,205 @@ mod fbcode {
                 ],
                 vec![],
             ).await;
+        }
+
+        // --- Additional input event constructors ---
+
+        fn analysis_start(label: &str, config: &str, rule: &str) -> buck2_data::buck_event::Data {
+            let (package, name) = label.split_once(':').unwrap();
+            buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                data: Some(buck2_data::span_start_event::Data::Analysis(
+                    buck2_data::AnalysisStart {
+                        target: Some(buck2_data::analysis_start::Target::StandardTarget(
+                            buck2_data::ConfiguredTargetLabel {
+                                label: Some(buck2_data::TargetLabel {
+                                    package: package.to_owned(),
+                                    name: name.to_owned(),
+                                }),
+                                configuration: Some(buck2_data::Configuration {
+                                    full_name: config.to_owned(),
+                                }),
+                                execution_configuration: None,
+                            },
+                        )),
+                        rule: rule.to_owned(),
+                    },
+                )),
+            })
+        }
+
+        fn action_execution_end(label: &str, config: &str, failed: bool) -> buck2_data::buck_event::Data {
+            let (package, name) = label.split_once(':').unwrap();
+            buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+                data: Some(buck2_data::span_end_event::Data::ActionExecution(
+                    Box::new(buck2_data::ActionExecutionEnd {
+                        key: Some(buck2_data::ActionKey {
+                            id: vec![],
+                            key: "".to_owned(),
+                            owner: Some(buck2_data::action_key::Owner::TargetLabel(
+                                buck2_data::ConfiguredTargetLabel {
+                                    label: Some(buck2_data::TargetLabel {
+                                        package: package.to_owned(),
+                                        name: name.to_owned(),
+                                    }),
+                                    configuration: Some(buck2_data::Configuration {
+                                        full_name: config.to_owned(),
+                                    }),
+                                    execution_configuration: None,
+                                },
+                            )),
+                        }),
+                        name: Some(buck2_data::ActionName {
+                            category: "cxx_compile".to_owned(),
+                            identifier: "main.cpp".to_owned(),
+                        }),
+                        failed: failed,
+                        commands: vec![],
+                        outputs: vec![],
+                        error_diagnostics: None,
+                        eligible_for_full_hybrid: Some(false),
+                        ..Default::default()
+                    }),
+                )),
+                stats: None,
+                duration: None,
+            })
+        }
+
+        fn parsed_target_patterns(patterns: &[&str]) -> buck2_data::buck_event::Data {
+            buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+                data: Some(buck2_data::instant_event::Data::TargetPatterns(
+                    buck2_data::ParsedTargetPatterns {
+                        target_patterns: patterns.iter().map(|p| buck2_data::TargetPattern {
+                            value: p.to_string(),
+                        }).collect(),
+                    },
+                )),
+            })
+        }
+
+        // --- BEP event graph (DAG) validation ---
+
+        /// Extract BEP event IDs and children from stream events.
+        /// Returns (event_ids, declared_children) where each is a set of
+        /// serialized BuildEventId bytes for comparison.
+        fn extract_bep_graph(events: &[BesTransportEvent]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+            let mut event_ids: Vec<Vec<u8>> = Vec::new();
+            let mut declared_children: Vec<Vec<u8>> = Vec::new();
+
+            for transport_event in events {
+                let v1_event = match transport_event {
+                    BesTransportEvent::Stream(e) => e,
+                    BesTransportEvent::Lifecycle(_) => continue,
+                };
+                let inner = v1_event.event.as_ref().unwrap();
+                let any = match inner {
+                    v1::build_event::Event::BazelEvent(any) => any,
+                    _ => continue, // ComponentStreamFinished etc.
+                };
+                let bes = build_event_stream::BuildEvent::decode(any.value.as_slice()).unwrap();
+                if let Some(id) = &bes.id {
+                    event_ids.push(id.encode_to_vec());
+                }
+                for child in &bes.children {
+                    declared_children.push(child.encode_to_vec());
+                }
+            }
+            (event_ids, declared_children)
+        }
+
+        /// Assert that the BEP event graph forms a valid DAG:
+        /// 1. Every declared child must appear as an emitted event.
+        /// 2. Every emitted event (except the root BuildStarted) must be
+        ///    declared as a child by some other event.
+        fn assert_valid_bep_dag(events: &[BesTransportEvent]) {
+            use std::collections::HashSet;
+
+            let (event_ids, declared_children) = extract_bep_graph(events);
+            let event_set: HashSet<&[u8]> = event_ids.iter().map(|v| v.as_slice()).collect();
+            let child_set: HashSet<&[u8]> = declared_children.iter().map(|v| v.as_slice()).collect();
+
+            // Every declared child must have a corresponding emitted event.
+            for child_bytes in &declared_children {
+                if !event_set.contains(child_bytes.as_slice()) {
+                    let child_id = build_event_stream::BuildEventId::decode(child_bytes.as_slice()).unwrap();
+                    panic!("Declared child was never emitted: {:?}", child_id);
+                }
+            }
+
+            // Every emitted event (except root) must be declared as a child.
+            let root_id = BuildEventId {
+                id: Some(build_event_id::Id::Started(build_event_id::BuildStartedId {})),
+            };
+            let root_bytes = root_id.encode_to_vec();
+            for event_bytes in &event_ids {
+                if event_bytes.as_slice() == root_bytes.as_slice() {
+                    continue; // Root is not a child of anything
+                }
+                if !child_set.contains(event_bytes.as_slice()) {
+                    let orphan_id = build_event_stream::BuildEventId::decode(event_bytes.as_slice()).unwrap();
+                    panic!("Orphan event (not declared as child of any event): {:?}", orphan_id);
+                }
+            }
+        }
+
+        // --- DAG validation tests ---
+
+        #[tokio::test]
+        async fn test_dag_empty_build() {
+            let t = TraceId::new();
+            let stream = tokio_stream::iter(vec![
+                buck_event(&t, build_start()),
+                buck_event(&t, build_end(true)),
+            ]);
+            let events: Vec<_> = buck_to_bazel_events(stream).collect().await;
+            assert_valid_bep_dag(&events);
+        }
+
+        #[tokio::test]
+        async fn test_dag_build_with_targets() {
+            let t = TraceId::new();
+            let stream = tokio_stream::iter(vec![
+                buck_event(&t, build_start()),
+                buck_event(&t, parsed_target_patterns(&["//foo/..."])),
+                buck_event(&t, analysis_start("foo:bar", "cfg//linux-x86_64", "rust_binary")),
+                buck_event(&t, analysis_start("foo:baz", "cfg//linux-x86_64", "rust_library")),
+                buck_event(&t, action_execution_end("foo:bar", "cfg//linux-x86_64", false)),
+                buck_event(&t, action_execution_end("foo:baz", "cfg//linux-x86_64", false)),
+                buck_event(&t, build_end(true)),
+            ]);
+            let events: Vec<_> = buck_to_bazel_events(stream).collect().await;
+            assert_valid_bep_dag(&events);
+        }
+
+        #[tokio::test]
+        async fn test_dag_build_with_targets_no_patterns() {
+            // When ParsedTargetPatterns is not sent, fallback to per-target patterns
+            let t = TraceId::new();
+            let stream = tokio_stream::iter(vec![
+                buck_event(&t, build_start()),
+                buck_event(&t, analysis_start("foo:bar", "cfg//linux-x86_64", "rust_binary")),
+                buck_event(&t, action_execution_end("foo:bar", "cfg//linux-x86_64", false)),
+                buck_event(&t, build_end(true)),
+            ]);
+            let events: Vec<_> = buck_to_bazel_events(stream).collect().await;
+            assert_valid_bep_dag(&events);
+        }
+
+        #[tokio::test]
+        async fn test_dag_build_with_multiple_patterns() {
+            let t = TraceId::new();
+            let stream = tokio_stream::iter(vec![
+                buck_event(&t, build_start()),
+                buck_event(&t, parsed_target_patterns(&["//foo:bar", "//foo:baz"])),
+                buck_event(&t, analysis_start("foo:bar", "cfg//linux-x86_64", "rust_binary")),
+                buck_event(&t, analysis_start("foo:baz", "cfg//linux-x86_64", "rust_library")),
+                buck_event(&t, action_execution_end("foo:bar", "cfg//linux-x86_64", false)),
+                buck_event(&t, action_execution_end("foo:baz", "cfg//linux-x86_64", false)),
+                buck_event(&t, build_end(true)),
+            ]);
+            let events: Vec<_> = buck_to_bazel_events(stream).collect().await;
+            assert_valid_bep_dag(&events);
         }
     }
 }
