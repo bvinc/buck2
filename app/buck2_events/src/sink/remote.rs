@@ -461,20 +461,25 @@ mod fbcode {
                                             }
                                         }
 
-                                        // Flush the target completed map.
-                                        for ((label, config), actions) in target_actions.into_iter() {
-                                            let success = actions.iter().all(|(_, success)| *success);
-                                            let children: Vec<_> = actions.into_iter().map(|(id, _)| id).collect();
+                                        // Emit TargetCompleted for ALL configured targets.
+                                        // Targets without actions (cached, header-only, etc.)
+                                        // still need TargetCompleted to fulfill the child
+                                        // declared by TargetConfigured, otherwise BES servers
+                                        // consider them "still building".
+                                        for (label, config, _rule) in configured_targets.iter() {
+                                            let actions = target_actions.remove(&(label.clone(), config.clone()));
+                                            let success = actions.as_ref().map_or(true, |a| a.iter().all(|(_, s)| *s));
+                                            let children: Vec<_> = actions.into_iter().flatten().map(|(id, _)| id).collect();
                                             let bes_event = build_event_stream::BuildEvent {
                                                 id: Some(build_event_stream::BuildEventId { id: Some(build_event_stream::build_event_id::Id::TargetCompleted(build_event_id::TargetCompletedId {
-                                                    label: label,
-                                                    configuration: Some(build_event_id::ConfigurationId { id: config }),
+                                                    label: label.clone(),
+                                                    configuration: Some(build_event_id::ConfigurationId { id: config.clone() }),
                                                     aspect: "".to_owned(),
                                                 })) }),
-                                                children: children,
+                                                children,
                                                 last_message: false,
                                                 payload: Some(build_event_stream::build_event::Payload::Completed(build_event_stream::TargetComplete {
-                                                    success: success,
+                                                    success,
                                                     output_group: vec![],
                                                     directory_output: vec![],
                                                     tag: vec![],
@@ -690,6 +695,50 @@ mod fbcode {
                                     payload: Some(build_event_stream::build_event::Payload::Progress(build_event_stream::Progress {
                                         stdout: String::new(),
                                         stderr: msg.message.clone(),
+                                    })),
+                                };
+                                let bazel_event = v1::build_event::Event::BazelEvent(prost_types::Any {
+                                    type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
+                                    value: bes_event.encode_to_vec(),
+                                });
+                                yield BesTransportEvent::Stream(v1::BuildEvent {
+                                    event_time: Some(event.timestamp().into()),
+                                    event: Some(bazel_event),
+                                });
+                                progress_count += 1;
+                            }
+                            Some(buck2_data::instant_event::Data::ConsoleWarning(msg)) => {
+                                let bes_event = build_event_stream::BuildEvent {
+                                    id: Some(BuildEventId { id: Some(build_event_id::Id::Progress(build_event_id::ProgressId { opaque_count: progress_count })) }),
+                                    children: vec![
+                                        BuildEventId { id: Some(build_event_id::Id::Progress(build_event_id::ProgressId { opaque_count: progress_count + 1 })) },
+                                    ],
+                                    last_message: false,
+                                    payload: Some(build_event_stream::build_event::Payload::Progress(build_event_stream::Progress {
+                                        stdout: String::new(),
+                                        stderr: msg.message.clone(),
+                                    })),
+                                };
+                                let bazel_event = v1::build_event::Event::BazelEvent(prost_types::Any {
+                                    type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
+                                    value: bes_event.encode_to_vec(),
+                                });
+                                yield BesTransportEvent::Stream(v1::BuildEvent {
+                                    event_time: Some(event.timestamp().into()),
+                                    event: Some(bazel_event),
+                                });
+                                progress_count += 1;
+                            }
+                            Some(buck2_data::instant_event::Data::StreamingOutput(msg)) => {
+                                let bes_event = build_event_stream::BuildEvent {
+                                    id: Some(BuildEventId { id: Some(build_event_id::Id::Progress(build_event_id::ProgressId { opaque_count: progress_count })) }),
+                                    children: vec![
+                                        BuildEventId { id: Some(build_event_id::Id::Progress(build_event_id::ProgressId { opaque_count: progress_count + 1 })) },
+                                    ],
+                                    last_message: false,
+                                    payload: Some(build_event_stream::build_event::Payload::Progress(build_event_stream::Progress {
+                                        stdout: msg.message.clone(),
+                                        stderr: String::new(),
                                     })),
                                 };
                                 let bazel_event = v1::build_event::Event::BazelEvent(prost_types::Any {
