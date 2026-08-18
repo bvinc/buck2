@@ -555,25 +555,46 @@ impl BatchUploadReqAggregator {
     }
 }
 
+/// Returns true if a tonic Status code is one retriable.
+///
+/// Note that tonic uses `Code::Unknown` as the fallback for any client-side
+/// transport error whose `h2::Error` doesn't carry a recognized `h2::Reason`
+/// (mid-stream IO failures, DNS errors, TCP drops without a frame). So
+/// retrying `Unknown` is essential for our case even though it's broader than
+/// strictly necessary - over-retrying an app-level `Unknown` costs at most
+/// the retry budget; under-retrying transient transport failures fails the
+/// build.
+fn is_retryable_status(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable
+            | tonic::Code::ResourceExhausted
+            | tonic::Code::Aborted
+            | tonic::Code::Internal
+            | tonic::Code::Unknown
+            | tonic::Code::DeadlineExceeded
+    )
+}
+
 /// Returns true if an error is a transient connection/transport error worth
 /// retrying. Walks the error chain checking for:
 ///   - `tonic::Status` with codes the gRPC retry policy treats as transient
-///     (Unavailable, ResourceExhausted, Aborted)
+///     (see `is_retryable_status`)
 ///   - `io::Error` of a kind that indicates a transport-level disruption
 ///     (BrokenPipe, ConnectionReset/Aborted, UnexpectedEof, TimedOut)
+///   - `io::Error` constructed via `io::Error::other(status)`: its `source()`
+///     transparently forwards through to the wrapped error's source, hiding
+///     the Status from `err.chain()`. We peek at the inner via `get_ref()`.
 ///
-/// `tonic::transport::Error` is not matched directly — its transient subset
-/// surfaces as an `io::Error` somewhere in the chain, which we catch above.
-/// Non-transient transport errors (TLS handshake, invalid URI) do not have
-/// an `io::Error` source, so they correctly do not retry.
+/// We deliberately do not downcast to `tonic::transport::Error` or
+/// `hyper::Error` directly: their transient subset surfaces as an `io::Error`
+/// reachable via the chain, while their non-transient cases (TLS handshake,
+/// invalid URI) correctly fall through.
 fn is_retryable(err: &anyhow::Error) -> bool {
     for cause in err.chain() {
         if let Some(status) = cause.downcast_ref::<tonic::Status>() {
-            match status.code() {
-                tonic::Code::Unavailable
-                | tonic::Code::ResourceExhausted
-                | tonic::Code::Aborted => return true,
-                _ => {}
+            if is_retryable_status(status) {
+                return true;
             }
         }
         if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
@@ -585,8 +606,16 @@ fn is_retryable(err: &anyhow::Error) -> bool {
                 | std::io::ErrorKind::TimedOut => return true,
                 _ => {}
             }
+            if let Some(inner) = io_err.get_ref() {
+                if let Some(status) = inner.downcast_ref::<tonic::Status>() {
+                    if is_retryable_status(status) {
+                        return true;
+                    }
+                }
+            }
         }
     }
+    tracing::debug!("Error not classified as retryable: {err:#}");
     false
 }
 
